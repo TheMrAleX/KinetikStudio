@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">Kinetik Studio</string>
+    <string name="projects_title">Proyectos</string>
+    <string name="new_project">Nuevo proyecto</string>
+    <string name="search_projects">Buscar proyectos...</string>
+    <string name="empty_projects_title">Tu estudio está listo</string>
+    <string name="empty_projects_subtitle">Importa clips de video o fotos para crear con fotogramas clave, curvas Bézier, máscaras y exportación sin pérdida visual.</string>
+    <string name="export_button">Exportar</string>
+    <string name="undo_desc">Deshacer</string>
+    <string name="redo_desc">Rehacer</string>
+    <string name="play_desc">Reproducir</string>
+    <string name="pause_desc">Pausar</string>
+    <string name="back_desc">Volver</string>
+    <string name="rename_project">Renombrar proyecto</string>
+    <string name="duplicate_project">Duplicar</string>
+    <string name="delete_project">Eliminar</string>
+    <string name="cancel">Cancelar</string>
+    <string name="confirm">Confirmar</string>
+    <string name="save">Guardar</string>
+</resources>

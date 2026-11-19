@@ -1,0 +1,6 @@
+{
+  "name": "Kinetik Studio",
+  "description": "Editor de video profesional móvil con fotogramas clave, curvas Bézier, máscaras, transiciones, efectos GPU y exportación en H.264 y H.265 sin pérdida visual.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
