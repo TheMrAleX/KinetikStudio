@@ -43,6 +43,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,10 +54,11 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -111,23 +113,34 @@ fun MultiTrackTimeline(
     val currentPxPerSec by rememberUpdatedState(pxPerSec)
     val totalMs = timeline.totalDurationMs.coerceAtLeast(1000L)
 
-    // Sync scroll position to playhead while playing or seeking externally
+    val currentPlayheadSeek by rememberUpdatedState(onSeekMs)
+    val currentTotalDurationMs by rememberUpdatedState(timeline.totalDurationMs)
+
+    // Sync scroll position to playhead while playing or seeking externally (never fight active user drag)
     LaunchedEffect(playheadMs, isPlaying, pxPerSec) {
-        val targetPx = (playheadMs * pxPerMs * density.density).roundToInt()
-        if (isPlaying || abs(scrollState.value - targetPx) > 12) {
+        if (!isPlaying && scrollState.isScrollInProgress) return@LaunchedEffect
+        val targetPx = (playheadMs * pxPerMs * density.density).roundToInt().coerceAtLeast(0)
+        if (isPlaying || abs(scrollState.value - targetPx) > 14) {
             programmaticScroll = true
-            scrollState.scrollTo(targetPx)
-            programmaticScroll = false
+            try {
+                scrollState.scrollTo(targetPx)
+            } finally {
+                programmaticScroll = false
+            }
         }
     }
 
-    // Update playhead when user manually scrolls timeline
-    LaunchedEffect(scrollState.value) {
-        if (!programmaticScroll && !isPlaying && scrollState.isScrollInProgress) {
-            val ms = (scrollState.value / (pxPerMs * density.density)).toLong()
-                .coerceIn(0L, timeline.totalDurationMs)
-            onSeekMs(ms)
-        }
+    // Update playhead smoothly when user manually scrubs timeline
+    LaunchedEffect(scrollState, pxPerMs, density.density) {
+        val scale = (pxPerMs * density.density).coerceAtLeast(0.001f)
+        snapshotFlow { scrollState.value }
+            .collect { offsetPx ->
+                if (!programmaticScroll && !isPlaying && scrollState.isScrollInProgress) {
+                    val ms = (offsetPx / scale).toLong()
+                        .coerceIn(0L, currentTotalDurationMs.coerceAtLeast(0L))
+                    currentPlayheadSeek(ms)
+                }
+            }
     }
 
     BoxWithConstraints(
@@ -305,46 +318,44 @@ private fun TimeRulerRow(
         else -> 5f
     }
     val stepMs = (stepSec * 1000f).toLong().coerceAtLeast(500L)
+    val textMeasurer = rememberTextMeasurer()
+    val labelStyle = remember { MonoTimecodeStyle.copy(fontSize = 10.sp, color = TextMuted) }
 
-    Box(
+    Canvas(
         modifier = Modifier
             .width(widthDp)
-            .height(22.dp)
+            .height(24.dp)
     ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            var t = 0L
-            while (t <= totalDurationMs + stepMs) {
-                val x = (t / 1000f) * pxPerSec * density
-                if (x <= size.width) {
-                    drawLine(
-                        color = HairlineOutline,
-                        start = Offset(x, size.height - 8.dp.toPx()),
-                        end = Offset(x, size.height),
-                        strokeWidth = 1.dp.toPx()
-                    )
-                    val halfX = x + (stepSec * 0.5f) * pxPerSec * density
-                    if (halfX <= size.width) {
-                        drawLine(
-                            color = HairlineOutline.copy(alpha = 0.5f),
-                            start = Offset(halfX, size.height - 4.dp.toPx()),
-                            end = Offset(halfX, size.height),
-                            strokeWidth = 1.dp.toPx()
+        var t = 0L
+        while (t <= totalDurationMs + stepMs) {
+            val x = (t / 1000f) * pxPerSec * density
+            if (x <= size.width) {
+                drawLine(
+                    color = HairlineOutline,
+                    start = Offset(x, size.height - 8.dp.toPx()),
+                    end = Offset(x, size.height),
+                    strokeWidth = 1.dp.toPx()
+                )
+                if (t <= totalDurationMs) {
+                    val label = formatDurationShort(t)
+                    val result = textMeasurer.measure(label, style = labelStyle)
+                    if (x + result.size.width <= size.width) {
+                        drawText(
+                            textLayoutResult = result,
+                            topLeft = Offset(x + 3.dp.toPx(), 1.dp.toPx())
                         )
                     }
                 }
-                t += stepMs
+                val halfX = x + (stepSec * 0.5f) * pxPerSec * density
+                if (halfX <= size.width) {
+                    drawLine(
+                        color = HairlineOutline.copy(alpha = 0.45f),
+                        start = Offset(halfX, size.height - 4.dp.toPx()),
+                        end = Offset(halfX, size.height),
+                        strokeWidth = 1.dp.toPx()
+                    )
+                }
             }
-        }
-
-        var t = 0L
-        while (t <= totalDurationMs) {
-            val offsetDp = ((t / 1000f) * pxPerSec).dp
-            Text(
-                text = formatDurationShort(t),
-                style = MonoTimecodeStyle.copy(fontSize = 10.sp),
-                color = TextMuted,
-                modifier = Modifier.offset(x = offsetDp + 2.dp)
-            )
             t += stepMs
         }
     }
@@ -358,9 +369,28 @@ private fun MainVideoClipItem(
     onSelect: () -> Unit,
     onTrimCommit: (Long, Long) -> Unit
 ) {
-    val clipWidthDp = (clip.effectiveDurationMs * pxPerMs).dp.coerceAtLeast(48.dp)
     var dragLeftMs by remember(clip.id, clip.sourceStartMs) { mutableFloatStateOf(0f) }
     var dragRightMs by remember(clip.id, clip.sourceEndMs) { mutableFloatStateOf(0f) }
+    var isTrimming by remember(clip.id) { mutableStateOf(false) }
+
+    val safeDur = clip.sourceDurationMs.coerceAtLeast(100L)
+    val previewStartMs = if (dragLeftMs != 0f) {
+        val maxStart = (clip.sourceEndMs - 250L).coerceAtLeast(0L)
+        (clip.sourceStartMs + (dragLeftMs * clip.speed).toLong()).coerceIn(0L, maxStart)
+    } else {
+        clip.sourceStartMs
+    }
+    val previewEndMs = if (dragRightMs != 0f) {
+        val minEnd = (clip.sourceStartMs + 250L).coerceAtMost(safeDur)
+        (clip.sourceEndMs + (dragRightMs * clip.speed).toLong()).coerceIn(minEnd, safeDur)
+    } else {
+        clip.sourceEndMs
+    }
+    val previewEffectiveDurationMs = (((previewEndMs - previewStartMs).coerceAtLeast(100L)) / clip.speed.coerceIn(0.1f, 10f))
+        .toLong()
+        .coerceAtLeast(100L)
+
+    val clipWidthDp = (previewEffectiveDurationMs * pxPerMs).dp.coerceAtLeast(52.dp)
 
     val allKeyframeOffsets = remember(clip.keyframes) {
         clip.keyframes.values.flatten().map { it.timeOffsetMs }.distinct().sorted()
@@ -416,17 +446,17 @@ private fun MainVideoClipItem(
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(horizontal = 6.dp, vertical = 3.dp),
+                .padding(horizontal = if (isSelected) 20.dp else 6.dp, vertical = 3.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Surface(
-                color = ObsidianBg.copy(alpha = 0.78f),
+                color = if (isTrimming) ElectricCyan else ObsidianBg.copy(alpha = 0.78f),
                 shape = RoundedCornerShape(4.dp)
             ) {
                 Text(
-                    text = formatDurationShort(clip.effectiveDurationMs),
-                    style = MonoTimecodeStyle.copy(fontSize = 9.sp),
-                    color = TextPrimary,
+                    text = formatDurationShort(previewEffectiveDurationMs),
+                    style = MonoTimecodeStyle.copy(fontSize = 9.sp, fontWeight = if (isTrimming) FontWeight.Bold else FontWeight.Normal),
+                    color = if (isTrimming) Color(0xFF002026) else TextPrimary,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                 )
             }
@@ -473,61 +503,87 @@ private fun MainVideoClipItem(
 
         // Left & Right Trim Handles when selected
         if (isSelected) {
+            val currentClip by rememberUpdatedState(clip)
+            val currentOnTrimCommit by rememberUpdatedState(onTrimCommit)
+
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterStart)
-                    .width(14.dp)
+                    .width(18.dp)
                     .fillMaxHeight()
                     .background(ElectricCyan)
                     .pointerInput(clip.id, pxPerMs) {
                         detectHorizontalDragGestures(
-                            onDragStart = { dragLeftMs = 0f },
-                            onDragEnd = {
-                                val nextStart = (clip.sourceStartMs + (dragLeftMs * clip.speed).toLong())
-                                    .coerceIn(0L, clip.sourceEndMs - 250L)
-                                onTrimCommit(nextStart, clip.sourceEndMs)
+                            onDragStart = {
                                 dragLeftMs = 0f
+                                isTrimming = true
+                            },
+                            onDragCancel = {
+                                dragLeftMs = 0f
+                                isTrimming = false
+                            },
+                            onDragEnd = {
+                                val c = currentClip
+                                val maxStart = (c.sourceEndMs - 250L).coerceAtLeast(0L)
+                                val nextStart = (c.sourceStartMs + (dragLeftMs * c.speed).toLong())
+                                    .coerceIn(0L, maxStart)
+                                currentOnTrimCommit(nextStart, c.sourceEndMs)
+                                dragLeftMs = 0f
+                                isTrimming = false
                             }
                         ) { _, dragAmount ->
-                            dragLeftMs += dragAmount / (pxPerMs * density)
+                            val scale = (pxPerMs * density).coerceAtLeast(0.001f)
+                            dragLeftMs += dragAmount / scale
                         }
                     },
                 contentAlignment = Alignment.Center
             ) {
                 Box(
                     modifier = Modifier
-                        .width(2.dp)
-                        .height(20.dp)
-                        .background(ObsidianBg, RoundedCornerShape(1.dp))
+                        .width(2.5.dp)
+                        .height(22.dp)
+                        .background(ObsidianBg, RoundedCornerShape(2.dp))
                 )
             }
 
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
-                    .width(14.dp)
+                    .width(18.dp)
                     .fillMaxHeight()
                     .background(ElectricCyan)
                     .pointerInput(clip.id, pxPerMs) {
                         detectHorizontalDragGestures(
-                            onDragStart = { dragRightMs = 0f },
-                            onDragEnd = {
-                                val nextEnd = (clip.sourceEndMs + (dragRightMs * clip.speed).toLong())
-                                    .coerceIn(clip.sourceStartMs + 250L, clip.sourceDurationMs)
-                                onTrimCommit(clip.sourceStartMs, nextEnd)
+                            onDragStart = {
                                 dragRightMs = 0f
+                                isTrimming = true
+                            },
+                            onDragCancel = {
+                                dragRightMs = 0f
+                                isTrimming = false
+                            },
+                            onDragEnd = {
+                                val c = currentClip
+                                val safeDur = c.sourceDurationMs.coerceAtLeast(100L)
+                                val minEnd = (c.sourceStartMs + 250L).coerceAtMost(safeDur)
+                                val nextEnd = (c.sourceEndMs + (dragRightMs * c.speed).toLong())
+                                    .coerceIn(minEnd, safeDur)
+                                currentOnTrimCommit(c.sourceStartMs, nextEnd)
+                                dragRightMs = 0f
+                                isTrimming = false
                             }
                         ) { _, dragAmount ->
-                            dragRightMs += dragAmount / (pxPerMs * density)
+                            val scale = (pxPerMs * density).coerceAtLeast(0.001f)
+                            dragRightMs += dragAmount / scale
                         }
                     },
                 contentAlignment = Alignment.Center
             ) {
                 Box(
                     modifier = Modifier
-                        .width(2.dp)
-                        .height(20.dp)
-                        .background(ObsidianBg, RoundedCornerShape(1.dp))
+                        .width(2.5.dp)
+                        .height(22.dp)
+                        .background(ObsidianBg, RoundedCornerShape(2.dp))
                 )
             }
         }

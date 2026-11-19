@@ -35,12 +35,17 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddCircleOutline
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
+import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MovieCreation
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ShowChart
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -64,6 +69,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -135,9 +141,12 @@ fun ProjectHubScreen(
     }
 
     val launchPicker = {
-        mediaPicker.launch(
-            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-        )
+        runCatching {
+            mediaPicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+            )
+        }
+        Unit
     }
 
     Scaffold(
@@ -222,6 +231,11 @@ fun ProjectHubScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp)
             ) {
+                if (uiState.projects.isNotEmpty() || uiState.searchQuery.isNotBlank()) {
+                    StudioNewProjectBanner(onClick = launchPicker)
+                    Spacer(Modifier.height(14.dp))
+                }
+
                 OutlinedTextField(
                     value = uiState.searchQuery,
                     onValueChange = onSearchChanged,
@@ -230,6 +244,16 @@ fun ProjectHubScreen(
                     },
                     leadingIcon = {
                         Icon(Icons.Default.Search, contentDescription = null, tint = TextMuted)
+                    },
+                    trailingIcon = {
+                        if (uiState.searchQuery.isNotEmpty()) {
+                            IconButton(
+                                onClick = { onSearchChanged("") },
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Limpiar búsqueda", tint = TextSecondary)
+                            }
+                        }
                     },
                     singleLine = true,
                     shape = RoundedCornerShape(14.dp),
@@ -464,6 +488,71 @@ fun ProjectHubScreen(
 }
 
 @Composable
+private fun StudioNewProjectBanner(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        color = StudioSurface,
+        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.4f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("new_project_banner_button")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    Brush.horizontalGradient(
+                        listOf(
+                            ElectricCyan.copy(alpha = 0.22f),
+                            CoralAmber.copy(alpha = 0.14f)
+                        )
+                    )
+                )
+                .padding(horizontal = 18.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(46.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(ElectricCyan),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AddCircleOutline,
+                        contentDescription = null,
+                        tint = Color(0xFF002026),
+                        modifier = Modifier.size(26.dp)
+                    )
+                }
+                Spacer(Modifier.width(14.dp))
+                Column {
+                    Text(
+                        text = "Nuevo Proyecto",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = TextPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Importa videos o fotos • Keyframes & H.265",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun EmptyStudioHero(
     hasQuery: Boolean,
     onCreateClick: () -> Unit,
@@ -473,7 +562,7 @@ private fun EmptyStudioHero(
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp),
+                .padding(horizontal = 4.dp),
             shape = RoundedCornerShape(24.dp),
             colors = CardDefaults.cardColors(containerColor = StudioSurface),
             border = BorderStroke(1.dp, HairlineOutline)
@@ -484,13 +573,13 @@ private fun EmptyStudioHero(
                     .background(
                         Brush.verticalGradient(
                             listOf(
-                                ElectricCyan.copy(alpha = 0.09f),
+                                ElectricCyan.copy(alpha = 0.12f),
                                 Color.Transparent,
-                                CoralAmber.copy(alpha = 0.06f)
+                                CoralAmber.copy(alpha = 0.08f)
                             )
                         )
                     )
-                    .padding(28.dp),
+                    .padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Box(
@@ -507,7 +596,7 @@ private fun EmptyStudioHero(
                         modifier = Modifier.size(36.dp)
                     )
                 }
-                Spacer(Modifier.height(18.dp))
+                Spacer(Modifier.height(16.dp))
                 Text(
                     text = if (hasQuery) "Sin resultados" else "Tu estudio está listo",
                     style = MaterialTheme.typography.headlineSmall,
@@ -518,22 +607,31 @@ private fun EmptyStudioHero(
                     text = if (hasQuery) {
                         "No encontramos proyectos que coincidan con tu búsqueda."
                     } else {
-                        "Importa videos o fotos para editar con keyframes, curvas Bézier, máscaras, transiciones GPU y exportación H.264/H.265."
+                        "Edita en móvil con fluidez de estudio: keyframes con curvas Bézier, máscaras, colorimetría GPU y exportación H.264/H.265."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextSecondary
                 )
                 if (!hasQuery) {
+                    Spacer(Modifier.height(16.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item { StudioFeaturePill(Icons.Default.ShowChart, "Curvas Bézier") }
+                        item { StudioFeaturePill(Icons.Default.AutoAwesome, "Máscaras & FX") }
+                        item { StudioFeaturePill(Icons.Default.HighQuality, "H.265 4K") }
+                    }
                     Spacer(Modifier.height(22.dp))
                     Button(
                         onClick = onCreateClick,
-                        shape = RoundedCornerShape(14.dp),
+                        shape = RoundedCornerShape(16.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = ElectricCyan,
                             contentColor = Color(0xFF002026)
                         ),
                         contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp),
-                        modifier = Modifier.testTag("empty_create_project_button")
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(54.dp)
+                            .testTag("empty_create_project_button")
                     ) {
                         Icon(Icons.Default.VideoLibrary, contentDescription = null)
                         Spacer(Modifier.width(10.dp))
@@ -541,6 +639,27 @@ private fun EmptyStudioHero(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun StudioFeaturePill(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = ElevatedSurface,
+        border = BorderStroke(1.dp, HairlineOutline)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = ElectricCyan, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(5.dp))
+            Text(label, style = MaterialTheme.typography.labelSmall, color = TextPrimary)
         }
     }
 }
@@ -576,7 +695,7 @@ private fun ProjectCard(
         ) {
             Box(
                 modifier = Modifier
-                    .width(96.dp)
+                    .width(108.dp)
                     .aspectRatio(16f / 10f)
                     .clip(RoundedCornerShape(12.dp))
                     .background(ElevatedSurface),
@@ -641,7 +760,9 @@ private fun ProjectCard(
             Box {
                 IconButton(
                     onClick = { menuExpanded = true },
-                    modifier = Modifier.testTag("project_menu_${project.id}")
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("project_menu_${project.id}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.MoreVert,

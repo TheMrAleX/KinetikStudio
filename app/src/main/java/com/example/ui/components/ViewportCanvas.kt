@@ -1,7 +1,10 @@
 package com.example.ui.components
 
+import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.annotation.OptIn
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -49,11 +52,13 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.CompositionPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.R
 import com.example.domain.engine.EvaluatedClipState
 import com.example.domain.engine.KeyframeEvaluator
 import com.example.domain.model.MaskSpec
@@ -94,77 +99,133 @@ fun ViewportCanvas(
     onEndGesture: () -> Unit,
     onUpdateMaskLive: (MaskSpec) -> Unit,
     onSelectText: (String) -> Unit,
+    onTextDragDelta: (textId: String, dxNorm: Float, dyNorm: Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val currentPlayhead by rememberUpdatedState(playheadMs)
     val currentIsPlaying by rememberUpdatedState(isPlaying)
+    val latestTimeline by rememberUpdatedState(timeline)
 
-    val compositionPlayer = remember(context) {
-        CompositionPlayer.Builder(context).build()
-    }
-
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    var activePlayer by remember { mutableStateOf<CompositionPlayer?>(null) }
+    var playbackErrorMessage by remember { mutableStateOf<String?>(null) }
     var isGestureHudVisible by remember { mutableStateOf(false) }
 
-    DisposableEffect(compositionPlayer) {
-        val listener = object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED && currentIsPlaying) {
-                    onPlaybackEnded()
+    val hasClips = timeline.mainClips.isNotEmpty()
+    val compositionKey = if (hasClips) compositionVersion else -1
+
+    // Media3 CompositionPlayer enforces setComposition() only once per instance.
+    // Dispose and recreate the player cleanly on each compositionKey bump.
+    DisposableEffect(context, compositionKey) {
+        if (compositionKey < 0) {
+            playerViewRef?.player = null
+            activePlayer = null
+            playbackErrorMessage = null
+            onDispose {}
+        } else {
+            var createdPlayer: CompositionPlayer? = null
+            var playerListener: Player.Listener? = null
+            runCatching {
+                val tl = latestTimeline
+                val comp = CompositionBuilder.buildComposition(
+                    context = context,
+                    timeline = tl,
+                    targetShortEdgePx = 720,
+                    includeTextOverlays = false
+                )
+                if (comp.sequences.isNotEmpty()) {
+                    val newPlayer = CompositionPlayer.Builder(context).build()
+                    val listener = object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_ENDED && currentIsPlaying) {
+                                onPlaybackEnded()
+                            }
+                        }
+
+                        override fun onPlayerError(error: PlaybackException) {
+                            playbackErrorMessage = error.localizedMessage ?: "Error en vista previa"
+                            onPlaybackEnded()
+                        }
+                    }
+                    newPlayer.addListener(listener)
+                    newPlayer.setComposition(comp)
+                    newPlayer.prepare()
+                    val safeDuration = tl.totalDurationMs.coerceAtLeast(0L)
+                    newPlayer.seekTo(currentPlayhead.coerceIn(0L, safeDuration))
+                    newPlayer.playWhenReady = currentIsPlaying
+                    playerViewRef?.player = newPlayer
+                    activePlayer = newPlayer
+                    createdPlayer = newPlayer
+                    playerListener = listener
+                    playbackErrorMessage = null
+                } else {
+                    playerViewRef?.player = null
+                    activePlayer = null
+                }
+            }.onFailure { err ->
+                playbackErrorMessage = err.localizedMessage ?: "No se pudo cargar la vista previa"
+                createdPlayer?.let { p ->
+                    playerListener?.let { p.removeListener(it) }
+                    runCatching { p.release() }
+                }
+                playerViewRef?.player = null
+                activePlayer = null
+            }
+
+            onDispose {
+                val p = createdPlayer
+                if (p != null) {
+                    if (playerViewRef?.player === p) {
+                        playerViewRef?.player = null
+                    }
+                    playerListener?.let { p.removeListener(it) }
+                    runCatching { p.release() }
+                }
+                if (activePlayer === p) {
+                    activePlayer = null
                 }
             }
         }
-        compositionPlayer.addListener(listener)
-        onDispose {
-            compositionPlayer.removeListener(listener)
-            compositionPlayer.release()
-        }
     }
 
-    LaunchedEffect(compositionVersion, timeline.mainClips.size, timeline.audioClips.size, timeline.aspectRatio) {
-        if (timeline.mainClips.isNotEmpty()) {
-            val comp = CompositionBuilder.buildComposition(
-                context = context,
-                timeline = timeline,
-                targetShortEdgePx = 720,
-                includeTextOverlays = false
-            )
-            compositionPlayer.setComposition(comp)
-            compositionPlayer.prepare()
-            compositionPlayer.seekTo(currentPlayhead)
-            compositionPlayer.playWhenReady = currentIsPlaying
-        } else {
-            compositionPlayer.stop()
-        }
-    }
-
-    LaunchedEffect(isPlaying) {
-        compositionPlayer.playWhenReady = isPlaying
-        if (isPlaying) {
-            if (compositionPlayer.currentPosition >= timeline.totalDurationMs - 40L && timeline.totalDurationMs > 0L) {
-                compositionPlayer.seekTo(0L)
+    LaunchedEffect(isPlaying, activePlayer) {
+        val player = activePlayer ?: return@LaunchedEffect
+        runCatching {
+            player.playWhenReady = isPlaying
+            if (isPlaying) {
+                val total = latestTimeline.totalDurationMs.coerceAtLeast(0L)
+                if (total > 0L && player.currentPosition >= total - 40L) {
+                    player.seekTo(0L)
+                }
+                player.play()
+            } else {
+                player.pause()
             }
-            compositionPlayer.play()
-        } else {
-            compositionPlayer.pause()
         }
     }
 
-    LaunchedEffect(isPlaying, timeline.totalDurationMs) {
+    LaunchedEffect(isPlaying, timeline.totalDurationMs, activePlayer) {
+        val player = activePlayer ?: return@LaunchedEffect
         if (isPlaying) {
+            val safeTotal = timeline.totalDurationMs.coerceAtLeast(0L)
             while (isActive) {
-                val pos = compositionPlayer.currentPosition.coerceIn(0L, timeline.totalDurationMs)
+                val pos = runCatching { player.currentPosition }.getOrDefault(0L)
+                    .coerceIn(0L, safeTotal)
                 onPlayheadTick(pos)
                 delay(32L)
             }
         }
     }
 
-    LaunchedEffect(playheadMs, isPlaying) {
+    LaunchedEffect(playheadMs, isPlaying, activePlayer) {
+        val player = activePlayer ?: return@LaunchedEffect
         if (!isPlaying && timeline.mainClips.isNotEmpty()) {
-            val diff = abs(compositionPlayer.currentPosition - playheadMs)
+            val safeTotal = timeline.totalDurationMs.coerceAtLeast(0L)
+            val target = playheadMs.coerceIn(0L, safeTotal)
+            val diff = abs(runCatching { player.currentPosition }.getOrDefault(target) - target)
             if (diff > 25L) {
-                compositionPlayer.seekTo(playheadMs)
+                runCatching { player.seekTo(target) }
             }
         }
     }
@@ -176,7 +237,11 @@ fun ViewportCanvas(
         contentAlignment = Alignment.Center
     ) {
         val containerAspect = maxWidth / maxHeight.coerceAtLeast(1.dp)
-        val targetAspect = timeline.aspectRatio.ratioFloat
+        val targetAspect by animateFloatAsState(
+            targetValue = timeline.aspectRatio.ratioFloat,
+            animationSpec = spring(stiffness = 500f),
+            label = "viewport_aspect"
+        )
 
         val frameModifier = if (containerAspect > targetAspect) {
             Modifier
@@ -190,28 +255,34 @@ fun ViewportCanvas(
 
         Box(
             modifier = frameModifier
-                .clip(RoundedCornerShape(10.dp))
+                .clip(RoundedCornerShape(12.dp))
                 .background(Color.Black)
-                .border(1.dp, HairlineOutline, RoundedCornerShape(10.dp))
+                .border(1.dp, HairlineOutline, RoundedCornerShape(12.dp))
                 .clipToBounds()
                 .testTag("video_preview_viewport")
         ) {
-            if (timeline.mainClips.isNotEmpty()) {
+            if (hasClips) {
                 AndroidView(
                     factory = { ctx ->
-                        PlayerView(ctx).apply {
+                        (LayoutInflater.from(ctx).inflate(R.layout.studio_player_view, null, false) as PlayerView).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
                             useController = false
                             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                            player = compositionPlayer
+                            setKeepContentOnPlayerReset(true)
+                            setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                            playerViewRef = this
+                            player = activePlayer
                         }
                     },
                     update = { view ->
-                        if (view.player !== compositionPlayer) {
-                            view.player = compositionPlayer
+                        if (playerViewRef !== view) {
+                            playerViewRef = view
+                        }
+                        if (view.player !== activePlayer) {
+                            view.player = activePlayer
                         }
                     },
                     modifier = Modifier.fillMaxSize()
@@ -259,7 +330,10 @@ fun ViewportCanvas(
                             isSelected = tc.id == selectedTextId,
                             viewportW = vpW,
                             viewportH = vpH,
-                            onSelect = { onSelectText(tc.id) }
+                            onSelect = { onSelectText(tc.id) },
+                            onBeginDrag = onBeginGesture,
+                            onDragDelta = { dxNorm, dyNorm -> onTextDragDelta(tc.id, dxNorm, dyNorm) },
+                            onEndDrag = onEndGesture
                         )
                     }
                 }
@@ -301,6 +375,24 @@ fun ViewportCanvas(
                 }
             }
 
+            // Interactive Mask Hint Pill
+            if (isMaskOverlayActive && evaluatedClipState?.mask?.type != MaskType.NONE && !isGestureHudVisible) {
+                Surface(
+                    color = ObsidianBg.copy(alpha = 0.78f),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                ) {
+                    Text(
+                        text = "Arrastra o pellizca la máscara",
+                        style = MonoTimecodeStyle,
+                        color = CoralAmber,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
             // Live Transform Numerical HUD
             if (isGestureHudVisible && evaluatedClipState != null) {
                 val tr = evaluatedClipState.transform
@@ -326,6 +418,24 @@ fun ViewportCanvas(
                     )
                 }
             }
+
+            playbackErrorMessage?.let { errMsg ->
+                Surface(
+                    color = ObsidianBg.copy(alpha = 0.88f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = errMsg,
+                        style = MonoTimecodeStyle,
+                        color = CoralAmber,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -337,7 +447,10 @@ private fun LiveTextOverlayItem(
     isSelected: Boolean,
     viewportW: Float,
     viewportH: Float,
-    onSelect: () -> Unit
+    onSelect: () -> Unit,
+    onBeginDrag: () -> Unit,
+    onDragDelta: (dxNorm: Float, dyNorm: Float) -> Unit,
+    onEndDrag: () -> Unit
 ) {
     val evaluated = KeyframeEvaluator.evaluateTextFrame(textClip, localMs)
     val tr = evaluated.transform
@@ -402,8 +515,18 @@ private fun LiveTextOverlayItem(
                 )
                 .pointerInput(textClip.id) {
                     detectDragGestures(
-                        onDragStart = { onSelect() },
-                        onDrag = { _, _ -> }
+                        onDragStart = {
+                            onSelect()
+                            onBeginDrag()
+                        },
+                        onDragEnd = { onEndDrag() },
+                        onDragCancel = { onEndDrag() },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            val dx = (dragAmount.x / viewportW.coerceAtLeast(1f)) * 2f
+                            val dy = -(dragAmount.y / viewportH.coerceAtLeast(1f)) * 2f
+                            onDragDelta(dx, dy)
+                        }
                     )
                 }
         ) {
@@ -436,16 +559,18 @@ private fun InteractiveMaskGuideOverlay(
 ) {
     val currentMask by rememberUpdatedState(mask)
     val dash = remember { PathEffect.dashPathEffect(floatArrayOf(14f, 10f), 0f) }
+    var isDragging by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .pointerInput(mask.type) {
                 detectTransformGestures { _, pan, zoom, rotation ->
+                    isDragging = true
                     onBeginDrag()
                     val m = currentMask
-                    val nextCx = (m.centerX + pan.x / viewportW).coerceIn(0.05f, 0.95f)
-                    val nextCy = (m.centerY - pan.y / viewportH).coerceIn(0.05f, 0.95f)
+                    val nextCx = (m.centerX + pan.x / viewportW.coerceAtLeast(1f)).coerceIn(0.05f, 0.95f)
+                    val nextCy = (m.centerY - pan.y / viewportH.coerceAtLeast(1f)).coerceIn(0.05f, 0.95f)
                     val nextW = (m.width * zoom).coerceIn(0.08f, 1.4f)
                     val nextH = (m.height * zoom).coerceIn(0.08f, 1.4f)
                     onMaskChange(
@@ -463,7 +588,8 @@ private fun InteractiveMaskGuideOverlay(
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent()
-                        if (event.changes.none { it.pressed }) {
+                        if (event.changes.none { it.pressed } && isDragging) {
+                            isDragging = false
                             onEndDrag()
                         }
                     }
@@ -473,8 +599,8 @@ private fun InteractiveMaskGuideOverlay(
         Canvas(modifier = Modifier.fillMaxSize()) {
             val cx = mask.centerX * size.width
             val cy = (1f - mask.centerY) * size.height
-            val w = mask.width * size.width
-            val h = mask.height * size.height
+            val w = (mask.width * size.width).coerceAtLeast(4f)
+            val h = (mask.height * size.height).coerceAtLeast(4f)
 
             rotate(degrees = mask.rotationDeg, pivot = Offset(cx, cy)) {
                 val stroke = Stroke(width = 2.dp.toPx(), pathEffect = dash)
@@ -512,17 +638,17 @@ private fun InteractiveMaskGuideOverlay(
                         )
                     }
                     MaskType.RECTANGLE, MaskType.HEART -> {
+                        val r = (mask.cornerRadius * w).coerceAtLeast(0f)
                         drawRoundRect(
                             color = CoralAmber,
                             topLeft = Offset(cx - w / 2f, cy - h / 2f),
                             size = Size(w, h),
-                            cornerRadius = CornerRadius(mask.cornerRadius * w, mask.cornerRadius * w),
+                            cornerRadius = CornerRadius(r, r),
                             style = stroke
                         )
                     }
                     MaskType.NONE -> Unit
                 }
-                // Center pivot handle
                 drawCircle(color = CoralAmber, radius = 6.dp.toPx(), center = Offset(cx, cy))
                 drawCircle(color = ObsidianBg, radius = 3.dp.toPx(), center = Offset(cx, cy))
             }

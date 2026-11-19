@@ -11,6 +11,7 @@ import com.example.domain.engine.KeyframeEvaluator
 import com.example.domain.engine.UndoRedoManager
 import com.example.domain.model.AspectRatio
 import com.example.domain.model.AudioClip
+import com.example.domain.model.ClipTransform
 import com.example.domain.model.ColorGradeSpec
 import com.example.domain.model.EasingCurve
 import com.example.domain.model.KeyframeNode
@@ -25,6 +26,7 @@ import com.example.domain.model.VideoClip
 import com.example.domain.model.VisualEffectType
 import com.example.engine.ExportConfig
 import com.example.engine.ExportEngine
+import com.example.engine.LiveClipRegistry
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -66,6 +68,7 @@ data class EditorUiState(
     val selectedTextId: String? = null,
     val selectedAudioId: String? = null,
     val activeToolTab: EditorToolTab = EditorToolTab.EDIT,
+    val isInspectorExpanded: Boolean = true,
     val isMaskOverlayActive: Boolean = false,
     val isFullscreenPreview: Boolean = false,
     val canUndo: Boolean = false,
@@ -109,6 +112,7 @@ class EditorViewModel(
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
     private var saveJob: Job? = null
+    private var rebuildJob: Job? = null
     private var liveGestureBaseline: ProjectTimeline? = null
 
     init {
@@ -117,29 +121,42 @@ class EditorViewModel(
 
     private fun loadProject() {
         viewModelScope.launch {
-            val project = repository.getProject(projectId)
-            if (project != null) {
-                val firstClipId = project.timeline.mainClips.firstOrNull()?.id
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        projectTitle = project.title,
-                        timeline = project.timeline,
-                        selectedClipId = firstClipId,
-                        compositionVersion = it.compositionVersion + 1
-                    )
+            runCatching { repository.getProject(projectId) }
+                .onSuccess { project ->
+                    if (project != null) {
+                        LiveClipRegistry.syncTimeline(project.timeline)
+                        val firstClipId = project.timeline.mainClips.firstOrNull()?.id
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                projectTitle = project.title,
+                                timeline = project.timeline,
+                                selectedClipId = firstClipId,
+                                compositionVersion = it.compositionVersion + 1
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(isLoading = false, statusBanner = "Proyecto no encontrado")
+                        }
+                    }
                 }
-            } else {
-                _uiState.update {
-                    it.copy(isLoading = false, statusBanner = "Proyecto no encontrado")
+                .onFailure { err ->
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusBanner = err.localizedMessage ?: "Error al cargar el proyecto"
+                        )
+                    }
                 }
-            }
         }
     }
 
     private fun mutateTimeline(
         recordUndo: Boolean = true,
         rebuildComposition: Boolean = true,
+        visualOnly: Boolean = false,
+        debounceRebuildMs: Long = 0L,
         transform: (ProjectTimeline) -> ProjectTimeline
     ) {
         val current = _uiState.value
@@ -147,15 +164,26 @@ class EditorViewModel(
         val nextTimeline = transform(prevTimeline)
         if (nextTimeline == prevTimeline) return
 
+        LiveClipRegistry.syncTimeline(nextTimeline)
+
         if (recordUndo) {
             undoRedoManager.recordBeforeMutation(prevTimeline)
         }
 
-        val clampedPlayhead = current.playheadMs.coerceIn(0L, nextTimeline.totalDurationMs)
+        val maxPlayhead = nextTimeline.totalDurationMs.coerceAtLeast(0L)
+        val clampedPlayhead = current.playheadMs.coerceIn(0L, maxPlayhead)
         val validSelectedClip = nextTimeline.mainClips.firstOrNull { it.id == current.selectedClipId }?.id
             ?: nextTimeline.mainClips.firstOrNull()?.id
         val validSelectedText = nextTimeline.textClips.firstOrNull { it.id == current.selectedTextId }?.id
         val validSelectedAudio = nextTimeline.audioClips.firstOrNull { it.id == current.selectedAudioId }?.id
+
+        // During active playback, LiveClipRegistry feeds GL shader uniforms at 60fps with zero player reset.
+        val shouldRebuildNow = rebuildComposition && !(visualOnly && current.isPlaying)
+        val shouldDebounce = !shouldRebuildNow && debounceRebuildMs > 0L && !(visualOnly && current.isPlaying)
+
+        if (shouldRebuildNow) {
+            rebuildJob?.cancel()
+        }
 
         _uiState.update {
             it.copy(
@@ -166,10 +194,22 @@ class EditorViewModel(
                 selectedAudioId = validSelectedAudio,
                 canUndo = undoRedoManager.canUndo,
                 canRedo = undoRedoManager.canRedo,
-                compositionVersion = if (rebuildComposition) it.compositionVersion + 1 else it.compositionVersion
+                compositionVersion = if (shouldRebuildNow) it.compositionVersion + 1 else it.compositionVersion
             )
         }
+
+        if (shouldDebounce) {
+            scheduleCompositionRebuild(debounceRebuildMs)
+        }
         scheduleAutoSave(current.projectTitle, nextTimeline)
+    }
+
+    private fun scheduleCompositionRebuild(delayMs: Long = 180L) {
+        rebuildJob?.cancel()
+        rebuildJob = viewModelScope.launch {
+            delay(delayMs)
+            _uiState.update { it.copy(compositionVersion = it.compositionVersion + 1) }
+        }
     }
 
     private fun scheduleAutoSave(title: String, timeline: ProjectTimeline) {
@@ -185,10 +225,22 @@ class EditorViewModel(
     fun undo() {
         val current = _uiState.value
         val restored = undoRedoManager.undo(current.timeline) ?: return
+        LiveClipRegistry.syncTimeline(restored)
+        rebuildJob?.cancel()
+        val maxPlayhead = restored.totalDurationMs.coerceAtLeast(0L)
+        val validSelectedClip = restored.mainClips.firstOrNull { it.id == current.selectedClipId }?.id
+            ?: restored.mainClips.firstOrNull()?.id
+        val validSelectedText = restored.textClips.firstOrNull { it.id == current.selectedTextId }?.id
+        val validSelectedAudio = restored.audioClips.firstOrNull { it.id == current.selectedAudioId }?.id
+
         _uiState.update {
             it.copy(
                 timeline = restored,
-                playheadMs = it.playheadMs.coerceIn(0L, restored.totalDurationMs),
+                playheadMs = it.playheadMs.coerceIn(0L, maxPlayhead),
+                selectedClipId = validSelectedClip,
+                selectedTextId = validSelectedText,
+                selectedAudioId = validSelectedAudio,
+                curveTarget = null,
                 canUndo = undoRedoManager.canUndo,
                 canRedo = undoRedoManager.canRedo,
                 compositionVersion = it.compositionVersion + 1
@@ -200,10 +252,22 @@ class EditorViewModel(
     fun redo() {
         val current = _uiState.value
         val restored = undoRedoManager.redo(current.timeline) ?: return
+        LiveClipRegistry.syncTimeline(restored)
+        rebuildJob?.cancel()
+        val maxPlayhead = restored.totalDurationMs.coerceAtLeast(0L)
+        val validSelectedClip = restored.mainClips.firstOrNull { it.id == current.selectedClipId }?.id
+            ?: restored.mainClips.firstOrNull()?.id
+        val validSelectedText = restored.textClips.firstOrNull { it.id == current.selectedTextId }?.id
+        val validSelectedAudio = restored.audioClips.firstOrNull { it.id == current.selectedAudioId }?.id
+
         _uiState.update {
             it.copy(
                 timeline = restored,
-                playheadMs = it.playheadMs.coerceIn(0L, restored.totalDurationMs),
+                playheadMs = it.playheadMs.coerceIn(0L, maxPlayhead),
+                selectedClipId = validSelectedClip,
+                selectedTextId = validSelectedText,
+                selectedAudioId = validSelectedAudio,
+                curveTarget = null,
                 canUndo = undoRedoManager.canUndo,
                 canRedo = undoRedoManager.canRedo,
                 compositionVersion = it.compositionVersion + 1
@@ -219,7 +283,8 @@ class EditorViewModel(
 
     fun togglePlayPause() {
         _uiState.update { state ->
-            val atEnd = state.playheadMs >= state.timeline.totalDurationMs && state.timeline.totalDurationMs > 0L
+            val total = state.timeline.totalDurationMs.coerceAtLeast(0L)
+            val atEnd = state.playheadMs >= total && total > 0L
             state.copy(
                 isPlaying = !state.isPlaying,
                 playheadMs = if (!state.isPlaying && atEnd) 0L else state.playheadMs
@@ -228,7 +293,7 @@ class EditorViewModel(
     }
 
     fun seekTo(ms: Long) {
-        val maxMs = _uiState.value.timeline.totalDurationMs
+        val maxMs = _uiState.value.timeline.totalDurationMs.coerceAtLeast(0L)
         val clamped = ms.coerceIn(0L, maxMs)
         _uiState.update { it.copy(playheadMs = clamped) }
     }
@@ -259,7 +324,9 @@ class EditorViewModel(
         _uiState.update {
             it.copy(
                 selectedTextId = textId,
-                activeToolTab = EditorToolTab.TEXT
+                activeToolTab = EditorToolTab.TEXT,
+                isInspectorExpanded = true,
+                isMaskOverlayActive = false
             )
         }
     }
@@ -268,16 +335,33 @@ class EditorViewModel(
         _uiState.update {
             it.copy(
                 selectedAudioId = audioId,
-                activeToolTab = EditorToolTab.AUDIO
+                activeToolTab = EditorToolTab.AUDIO,
+                isInspectorExpanded = true,
+                isMaskOverlayActive = false
             )
         }
     }
 
-    fun setActiveToolTab(tab: EditorToolTab) {
+    fun setActiveToolTab(tab: EditorToolTab, toggleIfSame: Boolean = false) {
+        _uiState.update { current ->
+            val nextExpanded = if (toggleIfSame && current.activeToolTab == tab) {
+                !current.isInspectorExpanded
+            } else {
+                true
+            }
+            current.copy(
+                activeToolTab = tab,
+                isInspectorExpanded = nextExpanded,
+                isMaskOverlayActive = tab == EditorToolTab.MASK && nextExpanded
+            )
+        }
+    }
+
+    fun setInspectorExpanded(expanded: Boolean) {
         _uiState.update {
             it.copy(
-                activeToolTab = tab,
-                isMaskOverlayActive = tab == EditorToolTab.MASK
+                isInspectorExpanded = expanded,
+                isMaskOverlayActive = expanded && it.activeToolTab == EditorToolTab.MASK
             )
         }
     }
@@ -288,6 +372,10 @@ class EditorViewModel(
 
     fun toggleFullscreenPreview() {
         _uiState.update { it.copy(isFullscreenPreview = !it.isFullscreenPreview) }
+    }
+
+    fun reportStatusBanner(message: String) {
+        _uiState.update { it.copy(statusBanner = message) }
     }
 
     fun dismissStatusBanner() {
@@ -329,16 +417,16 @@ class EditorViewModel(
         val clip = state.selectedMainClip ?: return
         val startMs = state.timeline.mainClipStartById(clip.id) ?: return
         val localMs = state.playheadMs - startMs
-        if (localMs <= 120L || localMs >= clip.effectiveDurationMs - 120L) {
+        val sourceSpan = clip.sourceEndMs - clip.sourceStartMs
+        if (sourceSpan <= 240L || localMs <= 120L || localMs >= clip.effectiveDurationMs - 120L) {
             _uiState.update { it.copy(statusBanner = "Coloca el cabezal dentro del clip para dividir.") }
             return
         }
 
-        val sourceDelta = (localMs * clip.speed).toLong()
-        val splitSourceMs = (clip.sourceStartMs + sourceDelta).coerceIn(
-            clip.sourceStartMs + 100L,
-            clip.sourceEndMs - 100L
-        )
+        val minSplitSource = clip.sourceStartMs + 100L
+        val maxSplitSource = clip.sourceEndMs - 100L
+        val sourceDelta = (localMs * clip.speed.coerceIn(0.1f, 8f)).toLong()
+        val splitSourceMs = (clip.sourceStartMs + sourceDelta).coerceIn(minSplitSource, maxSplitSource)
 
         val leftKeyframes = clip.keyframes.mapValues { (_, nodes) ->
             nodes.filter { it.timeOffsetMs <= localMs }
@@ -346,7 +434,7 @@ class EditorViewModel(
 
         val rightKeyframes = clip.keyframes.mapValues { (_, nodes) ->
             nodes.filter { it.timeOffsetMs >= localMs }.map {
-                it.copy(id = UUID.randomUUID().toString(), timeOffsetMs = it.timeOffsetMs - localMs)
+                it.copy(id = UUID.randomUUID().toString(), timeOffsetMs = (it.timeOffsetMs - localMs).coerceAtLeast(0L))
             }
         }.filterValues { it.isNotEmpty() }
 
@@ -378,8 +466,12 @@ class EditorViewModel(
                 mainClips = tl.mainClips.map { clip ->
                     if (clip.id != clipId) clip
                     else {
-                        val clampedStart = newSourceStartMs.coerceIn(0L, clip.sourceDurationMs - 200L)
-                        val clampedEnd = newSourceEndMs.coerceIn(clampedStart + 200L, clip.sourceDurationMs)
+                        val safeDur = clip.sourceDurationMs.coerceAtLeast(100L)
+                        val minSpan = minOf(200L, safeDur)
+                        val maxStart = (safeDur - minSpan).coerceAtLeast(0L)
+                        val clampedStart = newSourceStartMs.coerceIn(0L, maxStart)
+                        val minEnd = (clampedStart + minSpan).coerceAtMost(safeDur)
+                        val clampedEnd = newSourceEndMs.coerceIn(minEnd, safeDur)
                         clip.copy(sourceStartMs = clampedStart, sourceEndMs = clampedEnd)
                     }
                 }
@@ -427,7 +519,7 @@ class EditorViewModel(
         }
     }
 
-    // --- Direct Canvas Manipulation & Keyframe Auto-Keying ---
+    // --- Direct Canvas Manipulation & Continuous Slider Grouping ---
     fun beginLiveGesture() {
         if (liveGestureBaseline == null) {
             liveGestureBaseline = _uiState.value.timeline
@@ -443,7 +535,8 @@ class EditorViewModel(
         val state = _uiState.value
         val selectedText = state.selectedTextClip
         if (selectedText != null && state.activeToolTab == EditorToolTab.TEXT) {
-            val localMs = (state.playheadMs - selectedText.timelineStartMs).coerceIn(0L, selectedText.durationMs)
+            val maxTextDur = selectedText.durationMs.coerceAtLeast(0L)
+            val localMs = (state.playheadMs - selectedText.timelineStartMs).coerceIn(0L, maxTextDur)
             val eval = KeyframeEvaluator.evaluateTextFrame(selectedText, localMs).transform
             val nextX = (eval.posX + deltaNormX).coerceIn(-1.4f, 1.4f)
             val nextY = (eval.posY + deltaNormY).coerceIn(-1.4f, 1.4f)
@@ -470,7 +563,7 @@ class EditorViewModel(
 
         val clip = state.selectedMainClip ?: return
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: 0L
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
         val eval = KeyframeEvaluator.evaluateClipFrame(clip, localMs).transform
 
         val nextX = (eval.posX + deltaNormX).coerceIn(-1.5f, 1.5f)
@@ -478,7 +571,7 @@ class EditorViewModel(
         val nextScale = (eval.scale * scaleFactor).coerceIn(0.15f, 4.5f)
         val nextRot = eval.rotationDeg + deltaRotationDeg
 
-        mutateTimeline(recordUndo = false, rebuildComposition = false) { tl ->
+        mutateTimeline(recordUndo = false, rebuildComposition = false, visualOnly = true, debounceRebuildMs = 200L) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -510,19 +603,40 @@ class EditorViewModel(
         }
     }
 
-    fun endLiveGesture() {
+    fun updateTextPositionDelta(textId: String, deltaNormX: Float, deltaNormY: Float) {
+        mutateTimeline(recordUndo = false, rebuildComposition = false, visualOnly = true) { tl ->
+            tl.copy(
+                textClips = tl.textClips.map { tc ->
+                    if (tc.id != textId) tc
+                    else tc.copy(
+                        transform = tc.transform.copy(
+                            posX = (tc.transform.posX + deltaNormX).coerceIn(-1.4f, 1.4f),
+                            posY = (tc.transform.posY + deltaNormY).coerceIn(-1.4f, 1.4f)
+                        )
+                    )
+                }
+            )
+        }
+    }
+
+    fun endLiveGesture(rebuildImmediately: Boolean = true) {
         val baseline = liveGestureBaseline
         liveGestureBaseline = null
-        if (baseline != null && baseline != _uiState.value.timeline) {
+        val state = _uiState.value
+        if (baseline != null && baseline != state.timeline) {
             undoRedoManager.recordBeforeMutation(baseline)
+            val shouldRebuild = rebuildImmediately && !state.isPlaying
+            if (shouldRebuild) {
+                rebuildJob?.cancel()
+            }
             _uiState.update {
                 it.copy(
                     canUndo = undoRedoManager.canUndo,
                     canRedo = undoRedoManager.canRedo,
-                    compositionVersion = it.compositionVersion + 1
+                    compositionVersion = if (shouldRebuild) it.compositionVersion + 1 else it.compositionVersion
                 )
             }
-            scheduleAutoSave(_uiState.value.projectTitle, _uiState.value.timeline)
+            scheduleAutoSave(state.projectTitle, state.timeline)
         }
     }
 
@@ -533,7 +647,7 @@ class EditorViewModel(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
                     else c.copy(
-                        transform = com.example.domain.model.ClipTransform(),
+                        transform = ClipTransform(),
                         keyframes = c.keyframes - KeyframeProperty.POS_X - KeyframeProperty.POS_Y - KeyframeProperty.SCALE - KeyframeProperty.ROTATION
                     )
                 }
@@ -546,7 +660,7 @@ class EditorViewModel(
         val state = _uiState.value
         val clip = state.selectedMainClip ?: return
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: return
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
 
         val existingNodes = clip.keyframes[property].orEmpty()
         val nearby = existingNodes.firstOrNull { abs(it.timeOffsetMs - localMs) <= 45L }
@@ -572,7 +686,7 @@ class EditorViewModel(
         val state = _uiState.value
         val clip = state.selectedMainClip ?: return false
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: return false
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
         return clip.keyframes[property].orEmpty().any { abs(it.timeOffsetMs - localMs) <= 45L }
     }
 
@@ -587,7 +701,7 @@ class EditorViewModel(
             return
         }
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: 0L
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
 
         var segmentIndex = 0
         for (i in 0 until nodes.lastIndex) {
@@ -617,7 +731,7 @@ class EditorViewModel(
 
     fun updateCurveForSegment(curve: EasingCurve) {
         val target = _uiState.value.curveTarget ?: return
-        mutateTimeline { tl ->
+        mutateTimeline(recordUndo = true, rebuildComposition = false, debounceRebuildMs = 180L) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != target.clipId) c
@@ -694,7 +808,7 @@ class EditorViewModel(
     // --- Masks ---
     fun setMaskType(maskType: MaskType) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        mutateTimeline(visualOnly = true) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -704,13 +818,20 @@ class EditorViewModel(
         }
     }
 
-    fun updateMask(mask: MaskSpec, recordUndo: Boolean = true) {
+    fun updateMask(mask: MaskSpec, recordUndo: Boolean = true, livePreviewOnly: Boolean = false) {
         val state = _uiState.value
         val clip = state.selectedMainClip ?: return
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: 0L
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
 
-        mutateTimeline(recordUndo = recordUndo, rebuildComposition = recordUndo) { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+
+        mutateTimeline(
+            recordUndo = recordUndo && !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            visualOnly = true,
+            debounceRebuildMs = if (livePreviewOnly) 200L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -745,10 +866,10 @@ class EditorViewModel(
         val state = _uiState.value
         val clip = state.selectedMainClip ?: return
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: return
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
         val evalMask = KeyframeEvaluator.evaluateClipFrame(clip, localMs).mask
 
-        mutateTimeline { tl ->
+        mutateTimeline(visualOnly = true) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -767,9 +888,15 @@ class EditorViewModel(
     }
 
     // --- Effects, Color, Transitions, Speed, Opacity ---
-    fun setVisualEffect(effect: VisualEffectType, intensity: Float) {
+    fun setVisualEffect(effect: VisualEffectType, intensity: Float, livePreviewOnly: Boolean = false) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            visualOnly = true,
+            debounceRebuildMs = if (livePreviewOnly) 200L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -779,9 +906,15 @@ class EditorViewModel(
         }
     }
 
-    fun updateColorGrade(grade: ColorGradeSpec) {
+    fun updateColorGrade(grade: ColorGradeSpec, livePreviewOnly: Boolean = false) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            visualOnly = true,
+            debounceRebuildMs = if (livePreviewOnly) 200L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c else c.copy(colorGrade = grade)
@@ -790,9 +923,15 @@ class EditorViewModel(
         }
     }
 
-    fun setTransitionIn(transition: TransitionSpec) {
+    fun setTransitionIn(transition: TransitionSpec, livePreviewOnly: Boolean = false) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            visualOnly = true,
+            debounceRebuildMs = if (livePreviewOnly) 200L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c else c.copy(transitionIn = transition)
@@ -801,9 +940,14 @@ class EditorViewModel(
         }
     }
 
-    fun setClipSpeed(speed: Float, preset: SpeedRampPreset) {
+    fun setClipSpeed(speed: Float, preset: SpeedRampPreset, livePreviewOnly: Boolean = false) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            debounceRebuildMs = if (livePreviewOnly) 220L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c else c.copy(
@@ -815,20 +959,27 @@ class EditorViewModel(
         }
     }
 
-    fun setClipOpacity(opacity: Float) {
+    fun setClipOpacity(opacity: Float, livePreviewOnly: Boolean = false) {
         val state = _uiState.value
         val clip = state.selectedMainClip ?: return
         val clipStart = state.timeline.mainClipStartById(clip.id) ?: 0L
-        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs)
+        val localMs = (state.playheadMs - clipStart).coerceIn(0L, clip.effectiveDurationMs.coerceAtLeast(0L))
 
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            visualOnly = true,
+            debounceRebuildMs = if (livePreviewOnly) 200L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
                     else {
-                        var u = c.copy(transform = c.transform.copy(opacity = opacity.coerceIn(0f, 1f)))
+                        val safeOpacity = opacity.coerceIn(0f, 1f)
+                        var u = c.copy(transform = c.transform.copy(opacity = safeOpacity))
                         if (u.keyframes.containsKey(KeyframeProperty.OPACITY)) {
-                            u = upsertKeyframeOnClip(u, KeyframeProperty.OPACITY, localMs, opacity)
+                            u = upsertKeyframeOnClip(u, KeyframeProperty.OPACITY, localMs, safeOpacity)
                         }
                         u
                     }
@@ -837,9 +988,14 @@ class EditorViewModel(
         }
     }
 
-    fun setClipAudio(volume: Float, muted: Boolean, fadeInMs: Long, fadeOutMs: Long) {
+    fun setClipAudio(volume: Float, muted: Boolean, fadeInMs: Long, fadeOutMs: Long, livePreviewOnly: Boolean = false) {
         val clip = _uiState.value.selectedMainClip ?: return
-        mutateTimeline { tl ->
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            debounceRebuildMs = if (livePreviewOnly) 180L else 0L
+        ) { tl ->
             tl.copy(
                 mainClips = tl.mainClips.map { c ->
                     if (c.id != clip.id) c
@@ -878,8 +1034,13 @@ class EditorViewModel(
         }
     }
 
-    fun updateAudioClip(updated: AudioClip) {
-        mutateTimeline { tl ->
+    fun updateAudioClip(updated: AudioClip, livePreviewOnly: Boolean = false) {
+        if (livePreviewOnly) beginLiveGesture()
+        mutateTimeline(
+            recordUndo = !livePreviewOnly,
+            rebuildComposition = !livePreviewOnly,
+            debounceRebuildMs = if (livePreviewOnly) 180L else 0L
+        ) { tl ->
             tl.copy(audioClips = tl.audioClips.map { if (it.id == updated.id) updated else it })
         }
     }
@@ -927,7 +1088,7 @@ class EditorViewModel(
     }
 
     fun setProjectFps(fps: Int) {
-        mutateTimeline { tl -> tl.copy(fps = fps) }
+        mutateTimeline { tl -> tl.copy(fps = fps.coerceIn(24, 60)) }
     }
 
     // --- Export Studio ---
@@ -955,6 +1116,8 @@ class EditorViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        rebuildJob?.cancel()
+        saveJob?.cancel()
         exportEngine.cancelExport()
     }
 

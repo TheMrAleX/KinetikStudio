@@ -2,7 +2,6 @@ package com.example.engine
 
 import android.content.ContentValues
 import android.content.Context
-import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.net.Uri
 import android.os.Build
@@ -49,7 +48,7 @@ enum class ExportResolution(val label: String, val shortEdgePx: Int) {
 }
 
 enum class ExportQuality(val label: String, val multiplier: Float, val description: String) {
-    VISUALLY_LOSSLESS("Sin pérdida visual", 1.0f, "Bitrate maestro VBR para máxima nitidez"),
+    VISUALLY_LOSSLESS("Sin pérdida visual", 1.0f, "Bitrate maestro para máxima nitidez"),
     ULTRA("Ultra", 0.72f, "Detalle cinematográfico para 4K y 60fps"),
     HIGH("Alta", 0.48f, "Equilibrio ideal para Reels, Shorts y TikTok"),
     CUSTOM("Personalizada", 0.6f, "Control manual exacto de Mbps")
@@ -109,7 +108,8 @@ class ExportEngine(private val context: Context) {
     private var progressJob: Job? = null
 
     fun queryCodecCapabilities(): DeviceCodecCapabilities {
-        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        val codecs = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
+            .getOrDefault(emptyArray())
         var hasAvc = false
         var hasHevc = false
         var maxW = 1920
@@ -139,7 +139,12 @@ class ExportEngine(private val context: Context) {
                 }
             }
         }
-        return DeviceCodecCapabilities(hasAvc, hasHevc, maxW, maxH)
+        return DeviceCodecCapabilities(
+            supportsH264 = hasAvc || !hasHevc,
+            supportsH265 = hasHevc,
+            maxWidth = maxW,
+            maxHeight = maxH
+        )
     }
 
     fun startExport(
@@ -153,96 +158,113 @@ class ExportEngine(private val context: Context) {
             return
         }
 
-        cancelExport()
+        scope.launch(Dispatchers.Main) {
+            cancelExport()
 
-        val tempOutFile = File(context.cacheDir, "kinetik_export_${System.currentTimeMillis()}.mp4")
-        if (tempOutFile.exists()) tempOutFile.delete()
+            val tempOutFile = File(context.cacheDir, "kinetik_export_${System.currentTimeMillis()}.mp4")
+            if (tempOutFile.exists()) tempOutFile.delete()
 
-        val targetBitrate = config.resolveTargetBitrateBps()
-        val codecCaps = queryCodecCapabilities()
-        val chosenCodec = if (config.codec == ExportCodec.H265 && !codecCaps.supportsH265) {
-            ExportCodec.H264
-        } else {
-            config.codec
-        }
+            val targetBitrate = config.resolveTargetBitrateBps()
+            val codecCaps = queryCodecCapabilities()
+            val chosenCodec = if (config.codec == ExportCodec.H265 && !codecCaps.supportsH265) {
+                ExportCodec.H264
+            } else {
+                config.codec
+            }
 
-        val composition: Composition = CompositionBuilder.buildComposition(
-            context = context,
-            timeline = timeline.copy(fps = config.fps),
-            targetShortEdgePx = config.resolution.shortEdgePx,
-            includeTextOverlays = true
-        )
+            try {
+                val composition: Composition = CompositionBuilder.buildComposition(
+                    context = context,
+                    timeline = timeline.copy(fps = config.fps),
+                    targetShortEdgePx = config.resolution.shortEdgePx,
+                    includeTextOverlays = true
+                )
+                if (composition.sequences.isEmpty()) {
+                    _state.value = ExportUiState.Error("No se encontraron archivos multimedia válidos para exportar.")
+                    return@launch
+                }
 
-        val encoderFactory = DefaultEncoderFactory.Builder(context)
-            .setEnableFallback(true)
-            .setRequestedVideoEncoderSettings(
-                VideoEncoderSettings.Builder()
-                    .setBitrate(targetBitrate)
-                    .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                val encoderFactory = DefaultEncoderFactory.Builder(context)
+                    .setEnableFallback(true)
+                    .setRequestedVideoEncoderSettings(
+                        VideoEncoderSettings.Builder()
+                            .setBitrate(targetBitrate)
+                            .build()
+                    )
                     .build()
-            )
-            .build()
 
-        _state.value = ExportUiState.Exporting(
-            progress = 0.02f,
-            statusMessage = "Inicializando codificador ${chosenCodec.label}..."
-        )
+                _state.value = ExportUiState.Exporting(
+                    progress = 0.02f,
+                    statusMessage = "Inicializando codificador ${chosenCodec.label}..."
+                )
 
-        val transformer = Transformer.Builder(context)
-            .setVideoMimeType(chosenCodec.mimeType)
-            .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .setEncoderFactory(encoderFactory)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    progressJob?.cancel()
-                    scope.launch {
-                        runCatching {
-                            val savedUri = publishToGallery(tempOutFile, projectTitle)
-                            val bytes = tempOutFile.length().coerceAtLeast(exportResult.fileSizeBytes)
+                val transformer = Transformer.Builder(context)
+                    .setVideoMimeType(chosenCodec.mimeType)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .setEncoderFactory(encoderFactory)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            progressJob?.cancel()
+                            scope.launch(Dispatchers.Main) {
+                                runCatching {
+                                    val savedUri = publishToGallery(tempOutFile, projectTitle)
+                                    val bytes = tempOutFile.length().coerceAtLeast(exportResult.fileSizeBytes)
+                                    tempOutFile.delete()
+                                    _state.value = ExportUiState.Success(
+                                        outputUri = savedUri,
+                                        fileSizeBytes = bytes,
+                                        codecLabel = chosenCodec.label
+                                    )
+                                }.onFailure { err ->
+                                    tempOutFile.delete()
+                                    _state.value = ExportUiState.Error(
+                                        err.localizedMessage ?: "Error al guardar el video exportado."
+                                    )
+                                }
+                            }
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            progressJob?.cancel()
                             tempOutFile.delete()
-                            _state.value = ExportUiState.Success(
-                                outputUri = savedUri,
-                                fileSizeBytes = bytes,
-                                codecLabel = chosenCodec.label
-                            )
-                        }.onFailure { err ->
                             _state.value = ExportUiState.Error(
-                                err.localizedMessage ?: "Error al guardar el video exportado."
+                                exportException.localizedMessage
+                                    ?: "Fallo en la codificación ${chosenCodec.label}."
+                            )
+                        }
+                    })
+                    .build()
+
+                activeTransformer = transformer
+                transformer.start(composition, tempOutFile.absolutePath)
+
+                val holder = ProgressHolder()
+                progressJob = scope.launch(Dispatchers.Main) {
+                    while (isActive) {
+                        delay(150L)
+                        val stateCode = runCatching { transformer.getProgress(holder) }.getOrDefault(
+                            Transformer.PROGRESS_STATE_UNAVAILABLE
+                        )
+                        if (stateCode == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            val p = (holder.progress / 100f).coerceIn(0f, 0.99f)
+                            _state.value = ExportUiState.Exporting(
+                                progress = p,
+                                statusMessage = "Renderizando ${chosenCodec.label} • ${(p * 100).toInt()}%"
                             )
                         }
                     }
                 }
-
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    progressJob?.cancel()
-                    tempOutFile.delete()
-                    _state.value = ExportUiState.Error(
-                        exportException.localizedMessage
-                            ?: "Fallo en la codificación ${chosenCodec.label}."
-                    )
-                }
-            })
-            .build()
-
-        activeTransformer = transformer
-        transformer.start(composition, tempOutFile.absolutePath)
-
-        val holder = ProgressHolder()
-        progressJob = scope.launch {
-            while (isActive) {
-                delay(150L)
-                val stateCode = transformer.getProgress(holder)
-                if (stateCode == Transformer.PROGRESS_STATE_AVAILABLE) {
-                    val p = (holder.progress / 100f).coerceIn(0f, 0.99f)
-                    _state.value = ExportUiState.Exporting(
-                        progress = p,
-                        statusMessage = "Renderizando ${chosenCodec.label} • ${(p * 100).toInt()}%"
-                    )
-                }
+            } catch (t: Throwable) {
+                progressJob?.cancel()
+                tempOutFile.delete()
+                activeTransformer = null
+                _state.value = ExportUiState.Error(
+                    t.localizedMessage ?: "No se pudo iniciar la exportación de video."
+                )
             }
         }
     }
@@ -263,8 +285,11 @@ class ExportEngine(private val context: Context) {
 
     private suspend fun publishToGallery(sourceFile: File, projectTitle: String): Uri =
         withContext(Dispatchers.IO) {
+            if (!sourceFile.exists() || sourceFile.length() == 0L) {
+                throw IllegalStateException("El archivo exportado está vacío o no existe.")
+            }
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val safeTitle = projectTitle.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(24)
+            val safeTitle = projectTitle.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "Video" }.take(24)
             val fileName = "Kinetik_${safeTitle}_$stamp.mp4"
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -277,15 +302,22 @@ class ExportEngine(private val context: Context) {
                 val resolver = context.contentResolver
                 val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
                     ?: throw IllegalStateException("No se pudo crear el destino en MediaStore")
-                resolver.openOutputStream(uri)?.use { out ->
-                    FileInputStream(sourceFile).use { input ->
-                        input.copyTo(out, bufferSize = 64 * 1024)
+                try {
+                    val outStream = resolver.openOutputStream(uri)
+                        ?: throw IllegalStateException("No se pudo abrir flujo de escritura en la galería")
+                    outStream.use { out ->
+                        FileInputStream(sourceFile).use { input ->
+                            input.copyTo(out, bufferSize = 64 * 1024)
+                        }
                     }
+                    values.clear()
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    uri
+                } catch (e: Throwable) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw e
                 }
-                values.clear()
-                values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-                uri
             } else {
                 val exportsDir = File(context.filesDir, "exports")
                 if (!exportsDir.exists()) exportsDir.mkdirs()

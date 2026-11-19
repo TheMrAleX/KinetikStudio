@@ -318,11 +318,12 @@ private fun ExportOptionsForm(
     Spacer(Modifier.height(16.dp))
     Text("Calidad Visual", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
     Spacer(Modifier.height(8.dp))
-    Row(
+    androidx.compose.foundation.lazy.LazyRow(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        ExportQuality.entries.forEach { q ->
+        items(ExportQuality.entries.size) { index ->
+            val q = ExportQuality.entries[index]
             val selected = config.quality == q
             FilterChip(
                 selected = selected,
@@ -333,8 +334,7 @@ private fun ExportOptionsForm(
                     selectedLabelColor = ElectricCyan,
                     containerColor = ElevatedSurface,
                     labelColor = TextSecondary
-                ),
-                modifier = Modifier.weight(1f)
+                )
             )
         }
     }
@@ -354,7 +354,7 @@ private fun ExportOptionsForm(
             Text("${config.customBitrateMbps} Mbps", style = MonoTimecodeStyle, color = ElectricCyan)
         }
         Slider(
-            value = config.customBitrateMbps.toFloat(),
+            value = config.customBitrateMbps.toFloat().coerceIn(5f, 100f),
             onValueChange = { onConfigChange(config.copy(customBitrateMbps = it.toInt())) },
             valueRange = 5f..100f,
             colors = SliderDefaults.colors(thumbColor = ElectricCyan, activeTrackColor = ElectricCyan)
@@ -364,11 +364,12 @@ private fun ExportOptionsForm(
     Spacer(Modifier.height(14.dp))
     Text("Resolución", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
     Spacer(Modifier.height(8.dp))
-    Row(
+    androidx.compose.foundation.lazy.LazyRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        ExportResolution.entries.forEach { res ->
+        items(ExportResolution.entries.size) { index ->
+            val res = ExportResolution.entries[index]
             val selected = config.resolution == res
             FilterChip(
                 selected = selected,

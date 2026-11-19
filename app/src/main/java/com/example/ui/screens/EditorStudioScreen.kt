@@ -4,6 +4,13 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -57,10 +64,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -158,13 +168,14 @@ fun EditorStudioScreen(
                 onBack = onNavigateBack,
                 onUndo = viewModel::undo,
                 onRedo = viewModel::redo,
-                onAspectClick = { viewModel.setActiveToolTab(EditorToolTab.FORMAT) },
+                onAspectClick = { viewModel.setActiveToolTab(EditorToolTab.FORMAT, toggleIfSame = false) },
                 onExportClick = viewModel::openExportSheet
             )
 
             HorizontalDivider(color = HairlineOutline, thickness = 1.dp)
 
             val evaluatedClip = uiState.evaluatedSelectedClipState()
+            val hasKeyAtPlayhead = viewModel.hasKeyframeAtPlayhead(KeyframeProperty.SCALE)
 
             if (uiState.isFullscreenPreview) {
                 Box(
@@ -185,23 +196,80 @@ fun EditorStudioScreen(
                         onPlaybackEnded = { viewModel.setPlaying(false) },
                         onBeginGesture = viewModel::beginLiveGesture,
                         onTransformDelta = viewModel::updateTransformFromCanvasGesture,
-                        onEndGesture = viewModel::endLiveGesture,
-                        onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false) },
+                        onEndGesture = { viewModel.endLiveGesture(rebuildImmediately = true) },
+                        onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false, livePreviewOnly = true) },
                         onSelectText = viewModel::selectTextClip,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                    IconButton(
-                        onClick = viewModel::toggleFullscreenPreview,
+                        onTextDragDelta = viewModel::updateTextPositionDelta,
                         modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(16.dp)
-                            .clip(CircleShape)
-                            .background(StudioSurface.copy(alpha = 0.85f))
+                            .fillMaxSize()
+                            .padding(bottom = 74.dp)
+                    )
+
+                    // Mobile Fullscreen Transport Scrubber Bar
+                    Surface(
+                        color = StudioSurface.copy(alpha = 0.9f),
+                        shape = RoundedCornerShape(18.dp),
+                        border = BorderStroke(1.dp, HairlineOutline),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
                     ) {
-                        Icon(Icons.Default.FullscreenExit, "Salir de pantalla completa", tint = TextPrimary)
+                        val totalMs = uiState.timeline.totalDurationMs.coerceAtLeast(1L)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                onClick = viewModel::togglePlayPause,
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                            ) {
+                                Icon(
+                                    imageVector = if (uiState.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (uiState.isPlaying) "Pausar" else "Reproducir",
+                                    tint = ElectricCyan
+                                )
+                            }
+                            Slider(
+                                value = uiState.playheadMs.toFloat().coerceIn(0f, totalMs.toFloat()),
+                                onValueChange = { viewModel.seekTo(it.toLong()) },
+                                valueRange = 0f..totalMs.toFloat(),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = ElectricCyan,
+                                    activeTrackColor = ElectricCyan,
+                                    inactiveTrackColor = HairlineOutline
+                                ),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = formatTimecode(uiState.playheadMs),
+                                style = MonoTimecodeStyle,
+                                color = TextPrimary,
+                                modifier = Modifier.padding(horizontal = 6.dp)
+                            )
+                            IconButton(
+                                onClick = viewModel::toggleFullscreenPreview,
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                            ) {
+                                Icon(Icons.Default.FullscreenExit, "Salir de pantalla completa", tint = TextPrimary)
+                            }
+                        }
                     }
                 }
             } else {
+                val launchAddClip = {
+                    runCatching {
+                        addClipLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                        )
+                    }.onFailure {
+                        viewModel.reportStatusBanner("No se pudo abrir el selector multimedia.")
+                    }
+                    Unit
+                }
+
                 BoxWithConstraints(
                     modifier = Modifier
                         .weight(1f)
@@ -228,9 +296,10 @@ fun EditorStudioScreen(
                                     onPlaybackEnded = { viewModel.setPlaying(false) },
                                     onBeginGesture = viewModel::beginLiveGesture,
                                     onTransformDelta = viewModel::updateTransformFromCanvasGesture,
-                                    onEndGesture = viewModel::endLiveGesture,
-                                    onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false) },
+                                    onEndGesture = { viewModel.endLiveGesture(rebuildImmediately = true) },
+                                    onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false, livePreviewOnly = true) },
                                     onSelectText = viewModel::selectTextClip,
+                                    onTextDragDelta = viewModel::updateTextPositionDelta,
                                     modifier = Modifier
                                         .weight(0.58f)
                                         .fillMaxHeight()
@@ -238,6 +307,7 @@ fun EditorStudioScreen(
 
                                 EditorToolInspectorPanel(
                                     uiState = uiState,
+                                    onCollapseInspector = { viewModel.setInspectorExpanded(false) },
                                     onSplitClip = viewModel::splitSelectedClipAtPlayhead,
                                     onDuplicateClip = viewModel::duplicateSelectedClip,
                                     onDeleteClip = viewModel::deleteSelectedClip,
@@ -245,12 +315,15 @@ fun EditorStudioScreen(
                                     onResetTransform = viewModel::resetSelectedTransform,
                                     onSetSpeed = viewModel::setClipSpeed,
                                     onSetOpacity = viewModel::setClipOpacity,
+                                    onSliderDragEnd = { viewModel.endLiveGesture(rebuildImmediately = true) },
                                     onToggleKeyframe = viewModel::toggleKeyframe,
                                     onHasKeyframeAtPlayhead = viewModel::hasKeyframeAtPlayhead,
                                     onOpenCurveEditor = viewModel::openCurveEditor,
                                     onJumpKeyframe = viewModel::jumpToAdjacentKeyframe,
                                     onSetMaskType = viewModel::setMaskType,
-                                    onUpdateMask = { viewModel.updateMask(it, recordUndo = true) },
+                                    onUpdateMask = { mask, liveOnly ->
+                                        viewModel.updateMask(mask, recordUndo = !liveOnly, livePreviewOnly = liveOnly)
+                                    },
                                     onKeyframeMaskAll = viewModel::keyframeAllMaskProperties,
                                     onSetVisualEffect = viewModel::setVisualEffect,
                                     onUpdateColorGrade = viewModel::updateColorGrade,
@@ -264,6 +337,8 @@ fun EditorStudioScreen(
                                     onDeleteAudioClip = viewModel::deleteAudioClip,
                                     onSetAspectRatio = viewModel::setAspectRatio,
                                     onSetFps = viewModel::setProjectFps,
+                                    onStatusMessage = viewModel::reportStatusBanner,
+                                    showCollapseButton = false,
                                     modifier = Modifier
                                         .weight(0.42f)
                                         .fillMaxHeight()
@@ -272,6 +347,7 @@ fun EditorStudioScreen(
 
                             TransportControlBar(
                                 uiState = uiState,
+                                hasKeyAtPlayhead = hasKeyAtPlayhead,
                                 onTogglePlay = viewModel::togglePlayPause,
                                 onStepFrame = viewModel::stepFrame,
                                 onQuickKeyframe = { viewModel.toggleKeyframe(KeyframeProperty.SCALE) },
@@ -292,20 +368,27 @@ fun EditorStudioScreen(
                                 onTrimMainClip = viewModel::trimMainClip,
                                 onOpenTransitionForClip = { clipId ->
                                     viewModel.selectMainClip(clipId)
-                                    viewModel.setActiveToolTab(EditorToolTab.TRANSITIONS)
+                                    viewModel.setActiveToolTab(EditorToolTab.TRANSITIONS, toggleIfSame = false)
                                 },
                                 onSelectTextClip = viewModel::selectTextClip,
                                 onSelectAudioClip = viewModel::selectAudioClip,
-                                onAddClipClick = {
-                                    addClipLauncher.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                                    )
-                                },
+                                onAddClipClick = launchAddClip,
                                 modifier = Modifier.weight(0.44f)
                             )
                         }
                     } else {
-                        // Portrait Handheld NLE Layout
+                        // Portrait Mobile-First NLE Layout with collapsible inspector
+                        val viewportWeight by animateFloatAsState(
+                            targetValue = if (uiState.isInspectorExpanded) 0.36f else 0.56f,
+                            animationSpec = spring(stiffness = 420f),
+                            label = "viewport_weight"
+                        )
+                        val timelineWeight by animateFloatAsState(
+                            targetValue = if (uiState.isInspectorExpanded) 0.27f else 0.44f,
+                            animationSpec = spring(stiffness = 420f),
+                            label = "timeline_weight"
+                        )
+
                         Column(modifier = Modifier.fillMaxSize()) {
                             ViewportCanvas(
                                 timeline = uiState.timeline,
@@ -319,14 +402,16 @@ fun EditorStudioScreen(
                                 onPlaybackEnded = { viewModel.setPlaying(false) },
                                 onBeginGesture = viewModel::beginLiveGesture,
                                 onTransformDelta = viewModel::updateTransformFromCanvasGesture,
-                                onEndGesture = viewModel::endLiveGesture,
-                                onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false) },
+                                onEndGesture = { viewModel.endLiveGesture(rebuildImmediately = true) },
+                                onUpdateMaskLive = { viewModel.updateMask(it, recordUndo = false, livePreviewOnly = true) },
                                 onSelectText = viewModel::selectTextClip,
-                                modifier = Modifier.weight(0.40f)
+                                onTextDragDelta = viewModel::updateTextPositionDelta,
+                                modifier = Modifier.weight(viewportWeight)
                             )
 
                             TransportControlBar(
                                 uiState = uiState,
+                                hasKeyAtPlayhead = hasKeyAtPlayhead,
                                 onTogglePlay = viewModel::togglePlayPause,
                                 onStepFrame = viewModel::stepFrame,
                                 onQuickKeyframe = { viewModel.toggleKeyframe(KeyframeProperty.SCALE) },
@@ -347,50 +432,60 @@ fun EditorStudioScreen(
                                 onTrimMainClip = viewModel::trimMainClip,
                                 onOpenTransitionForClip = { clipId ->
                                     viewModel.selectMainClip(clipId)
-                                    viewModel.setActiveToolTab(EditorToolTab.TRANSITIONS)
+                                    viewModel.setActiveToolTab(EditorToolTab.TRANSITIONS, toggleIfSame = false)
                                 },
                                 onSelectTextClip = viewModel::selectTextClip,
                                 onSelectAudioClip = viewModel::selectAudioClip,
-                                onAddClipClick = {
-                                    addClipLauncher.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                onAddClipClick = launchAddClip,
+                                modifier = Modifier.weight(timelineWeight)
+                            )
+
+                            AnimatedVisibility(
+                                visible = uiState.isInspectorExpanded,
+                                enter = expandVertically(spring(stiffness = 420f)) + fadeIn(),
+                                exit = shrinkVertically(spring(stiffness = 420f)) + fadeOut(),
+                                modifier = Modifier.weight(if (uiState.isInspectorExpanded) 0.37f else 0.0001f)
+                            ) {
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    HorizontalDivider(color = HairlineOutline, thickness = 1.dp)
+                                    EditorToolInspectorPanel(
+                                        uiState = uiState,
+                                        onCollapseInspector = { viewModel.setInspectorExpanded(false) },
+                                        onSplitClip = viewModel::splitSelectedClipAtPlayhead,
+                                        onDuplicateClip = viewModel::duplicateSelectedClip,
+                                        onDeleteClip = viewModel::deleteSelectedClip,
+                                        onMoveClip = viewModel::moveSelectedClip,
+                                        onResetTransform = viewModel::resetSelectedTransform,
+                                        onSetSpeed = viewModel::setClipSpeed,
+                                        onSetOpacity = viewModel::setClipOpacity,
+                                        onSliderDragEnd = { viewModel.endLiveGesture(rebuildImmediately = true) },
+                                        onToggleKeyframe = viewModel::toggleKeyframe,
+                                        onHasKeyframeAtPlayhead = viewModel::hasKeyframeAtPlayhead,
+                                        onOpenCurveEditor = viewModel::openCurveEditor,
+                                        onJumpKeyframe = viewModel::jumpToAdjacentKeyframe,
+                                        onSetMaskType = viewModel::setMaskType,
+                                        onUpdateMask = { mask, liveOnly ->
+                                            viewModel.updateMask(mask, recordUndo = !liveOnly, livePreviewOnly = liveOnly)
+                                        },
+                                        onKeyframeMaskAll = viewModel::keyframeAllMaskProperties,
+                                        onSetVisualEffect = viewModel::setVisualEffect,
+                                        onUpdateColorGrade = viewModel::updateColorGrade,
+                                        onSetTransition = viewModel::setTransitionIn,
+                                        onAddText = { viewModel.addTextClip() },
+                                        onUpdateText = viewModel::updateTextClip,
+                                        onDeleteText = viewModel::deleteTextClip,
+                                        onSetClipAudio = viewModel::setClipAudio,
+                                        onAddAudioUri = viewModel::addAudioTrack,
+                                        onUpdateAudioClip = viewModel::updateAudioClip,
+                                        onDeleteAudioClip = viewModel::deleteAudioClip,
+                                        onSetAspectRatio = viewModel::setAspectRatio,
+                                        onSetFps = viewModel::setProjectFps,
+                                        onStatusMessage = viewModel::reportStatusBanner,
+                                        showCollapseButton = true,
+                                        modifier = Modifier.fillMaxSize()
                                     )
-                                },
-                                modifier = Modifier.weight(0.32f)
-                            )
-
-                            HorizontalDivider(color = HairlineOutline, thickness = 1.dp)
-
-                            EditorToolInspectorPanel(
-                                uiState = uiState,
-                                onSplitClip = viewModel::splitSelectedClipAtPlayhead,
-                                onDuplicateClip = viewModel::duplicateSelectedClip,
-                                onDeleteClip = viewModel::deleteSelectedClip,
-                                onMoveClip = viewModel::moveSelectedClip,
-                                onResetTransform = viewModel::resetSelectedTransform,
-                                onSetSpeed = viewModel::setClipSpeed,
-                                onSetOpacity = viewModel::setClipOpacity,
-                                onToggleKeyframe = viewModel::toggleKeyframe,
-                                onHasKeyframeAtPlayhead = viewModel::hasKeyframeAtPlayhead,
-                                onOpenCurveEditor = viewModel::openCurveEditor,
-                                onJumpKeyframe = viewModel::jumpToAdjacentKeyframe,
-                                onSetMaskType = viewModel::setMaskType,
-                                onUpdateMask = { viewModel.updateMask(it, recordUndo = true) },
-                                onKeyframeMaskAll = viewModel::keyframeAllMaskProperties,
-                                onSetVisualEffect = viewModel::setVisualEffect,
-                                onUpdateColorGrade = viewModel::updateColorGrade,
-                                onSetTransition = viewModel::setTransitionIn,
-                                onAddText = { viewModel.addTextClip() },
-                                onUpdateText = viewModel::updateTextClip,
-                                onDeleteText = viewModel::deleteTextClip,
-                                onSetClipAudio = viewModel::setClipAudio,
-                                onAddAudioUri = viewModel::addAudioTrack,
-                                onUpdateAudioClip = viewModel::updateAudioClip,
-                                onDeleteAudioClip = viewModel::deleteAudioClip,
-                                onSetAspectRatio = viewModel::setAspectRatio,
-                                onSetFps = viewModel::setProjectFps,
-                                modifier = Modifier.weight(0.28f)
-                            )
+                                }
+                            }
                         }
                     }
                 }
@@ -398,7 +493,8 @@ fun EditorStudioScreen(
                 // Bottom Tool Dock with mandatory navigationBarsPadding()
                 EditorToolDock(
                     activeTab = uiState.activeToolTab,
-                    onSelectTab = viewModel::setActiveToolTab
+                    isExpanded = uiState.isInspectorExpanded,
+                    onSelectTab = { tab -> viewModel.setActiveToolTab(tab, toggleIfSame = true) }
                 )
             }
         }
@@ -442,17 +538,25 @@ private fun EditorTopBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(StudioSurface)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(
             onClick = onBack,
-            modifier = Modifier.testTag("editor_back_button")
+            modifier = Modifier
+                .minimumInteractiveComponentSize()
+                .testTag("editor_back_button")
         ) {
             Icon(Icons.AutoMirrored.Filled.ArrowBack, "Volver", tint = TextPrimary)
         }
 
-        Column(modifier = Modifier.weight(1f)) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onAspectClick)
+                .padding(horizontal = 4.dp, vertical = 2.dp)
+        ) {
             Text(
                 text = uiState.projectTitle.ifBlank { "Estudio" },
                 style = MaterialTheme.typography.titleSmall,
@@ -470,7 +574,9 @@ private fun EditorTopBar(
         IconButton(
             onClick = onUndo,
             enabled = uiState.canUndo,
-            modifier = Modifier.testTag("undo_button")
+            modifier = Modifier
+                .minimumInteractiveComponentSize()
+                .testTag("undo_button")
         ) {
             Icon(
                 Icons.AutoMirrored.Filled.Undo,
@@ -482,7 +588,9 @@ private fun EditorTopBar(
         IconButton(
             onClick = onRedo,
             enabled = uiState.canRedo,
-            modifier = Modifier.testTag("redo_button")
+            modifier = Modifier
+                .minimumInteractiveComponentSize()
+                .testTag("redo_button")
         ) {
             Icon(
                 Icons.AutoMirrored.Filled.Redo,
@@ -493,14 +601,14 @@ private fun EditorTopBar(
 
         Button(
             onClick = onExportClick,
-            shape = RoundedCornerShape(10.dp),
+            shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = ElectricCyan,
                 contentColor = Color(0xFF002026)
             ),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
             modifier = Modifier
-                .height(36.dp)
+                .height(40.dp)
                 .testTag("open_export_button")
         ) {
             Icon(Icons.Default.Upload, null, modifier = Modifier.size(16.dp))
@@ -513,6 +621,7 @@ private fun EditorTopBar(
 @Composable
 private fun TransportControlBar(
     uiState: EditorUiState,
+    hasKeyAtPlayhead: Boolean,
     onTogglePlay: () -> Unit,
     onStepFrame: (Int) -> Unit,
     onQuickKeyframe: () -> Unit,
@@ -522,7 +631,7 @@ private fun TransportControlBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(StudioSurface)
-            .padding(horizontal = 12.dp, vertical = 4.dp),
+            .padding(horizontal = 12.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -535,7 +644,7 @@ private fun TransportControlBar(
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(
                 onClick = { onStepFrame(-1) },
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.minimumInteractiveComponentSize()
             ) {
                 Icon(Icons.Default.SkipPrevious, "Cuadro anterior", tint = TextSecondary)
             }
@@ -543,7 +652,7 @@ private fun TransportControlBar(
             IconButton(
                 onClick = onTogglePlay,
                 modifier = Modifier
-                    .size(42.dp)
+                    .size(48.dp)
                     .clip(CircleShape)
                     .background(ElevatedSurface)
                     .testTag("play_pause_button")
@@ -557,7 +666,7 @@ private fun TransportControlBar(
 
             IconButton(
                 onClick = { onStepFrame(1) },
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.minimumInteractiveComponentSize()
             ) {
                 Icon(Icons.Default.SkipNext, "Siguiente cuadro", tint = TextSecondary)
             }
@@ -567,15 +676,19 @@ private fun TransportControlBar(
             IconButton(
                 onClick = onQuickKeyframe,
                 modifier = Modifier
-                    .size(40.dp)
+                    .minimumInteractiveComponentSize()
                     .testTag("quick_keyframe_button")
             ) {
-                Icon(Icons.Default.Diamond, "Keyframe rápido", tint = CoralAmber)
+                Icon(
+                    Icons.Default.Diamond,
+                    "Keyframe rápido",
+                    tint = if (hasKeyAtPlayhead) ElectricCyan else CoralAmber
+                )
             }
 
             IconButton(
                 onClick = onToggleFullscreen,
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.minimumInteractiveComponentSize()
             ) {
                 Icon(Icons.Default.Fullscreen, "Pantalla completa", tint = TextSecondary)
             }
@@ -586,6 +699,7 @@ private fun TransportControlBar(
 @Composable
 private fun EditorToolDock(
     activeTab: EditorToolTab,
+    isExpanded: Boolean,
     onSelectTab: (EditorToolTab) -> Unit
 ) {
     Surface(
@@ -602,14 +716,14 @@ private fun EditorToolDock(
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(EditorToolTab.entries) { tab ->
-                val selected = tab == activeTab
+                val selected = tab == activeTab && isExpanded
                 val icon = toolTabIcon(tab)
                 Column(
                     modifier = Modifier
                         .clip(RoundedCornerShape(12.dp))
-                        .background(if (selected) ElectricCyan.copy(alpha = 0.14f) else Color.Transparent)
+                        .background(if (selected) ElectricCyan.copy(alpha = 0.16f) else Color.Transparent)
                         .clickable { onSelectTab(tab) }
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
                         .testTag("tool_tab_${tab.name}"),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -617,7 +731,7 @@ private fun EditorToolDock(
                         imageVector = icon,
                         contentDescription = tab.label,
                         tint = if (selected) ElectricCyan else TextSecondary,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(21.dp)
                     )
                     Spacer(Modifier.height(3.dp))
                     Text(

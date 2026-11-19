@@ -12,17 +12,20 @@ import android.text.StaticLayout
 import android.text.TextPaint
 import androidx.annotation.OptIn
 import androidx.core.content.res.ResourcesCompat
+import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.OverlaySettings
 import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.common.audio.ChannelMixingAudioProcessor
-import androidx.media3.common.audio.ChannelMixingMatrix
+import androidx.media3.common.audio.AudioProcessor.AudioFormat
+import androidx.media3.common.audio.AudioProcessor.UnhandledAudioFormatException
+import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
+import androidx.media3.effect.SpeedChangeEffect
 import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -34,6 +37,8 @@ import com.example.domain.model.ProjectTimeline
 import com.example.domain.model.TextClip
 import com.example.domain.model.TextFontStyle
 import java.io.File
+import java.nio.ByteBuffer
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @OptIn(UnstableApi::class)
@@ -45,27 +50,46 @@ object CompositionBuilder {
         targetShortEdgePx: Int = 1080,
         includeTextOverlays: Boolean = false
     ): Composition {
-        val (outW, outH) = timeline.aspectRatio.resolveDimensions(targetShortEdgePx)
+        val (rawW, rawH) = timeline.aspectRatio.resolveDimensions(targetShortEdgePx.coerceAtLeast(16))
+        val outW = rawW.coerceAtLeast(16)
+        val outH = rawH.coerceAtLeast(16)
         val aspectFloat = timeline.aspectRatio.ratioFloat
 
-        val mainEditedItems = timeline.mainClips.mapIndexed { index, clip ->
-            val mediaUri = Uri.fromFile(File(clip.mediaPath))
+        val mainEditedItems = timeline.mainClips.mapIndexedNotNull { index, clip ->
+            val mediaFile = File(clip.mediaPath)
+            if (!mediaFile.exists()) return@mapIndexedNotNull null
+
+            val mediaUri = Uri.fromFile(mediaFile)
             val mediaItemBuilder = MediaItem.Builder().setUri(mediaUri)
+
+            val durationUs: Long
             if (clip.isImage) {
-                mediaItemBuilder.setImageDurationMs(clip.effectiveDurationMs)
+                val imgMs = clip.effectiveDurationMs.coerceAtLeast(100L)
+                mediaItemBuilder.setImageDurationMs(imgMs)
+                durationUs = imgMs * 1000L
             } else {
+                val safeSourceMs = clip.sourceDurationMs.coerceAtLeast(250L)
+                val safeStartMs = clip.sourceStartMs.coerceIn(0L, safeSourceMs - 100L)
+                val safeEndMs = clip.sourceEndMs.coerceIn(safeStartMs + 100L, safeSourceMs)
                 mediaItemBuilder.setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(clip.sourceStartMs)
-                        .setEndPositionMs(clip.sourceEndMs)
+                        .setStartPositionMs(safeStartMs)
+                        .setEndPositionMs(safeEndMs)
                         .build()
                 )
+                durationUs = safeSourceMs * 1000L
             }
 
             val videoEffects = mutableListOf<Effect>(
                 Presentation.createForWidthAndHeight(outW, outH, Presentation.LAYOUT_SCALE_TO_FIT),
-                StudioClipGlEffect(clip, aspectFloat)
+                StudioClipGlEffect(clip, aspectFloat, useLiveRegistry = !includeTextOverlays)
             )
+
+            val hasSpeedChange = !clip.isImage && abs(clip.speed - 1f) > 0.01f
+            val clampedSpeed = clip.speed.coerceIn(0.1f, 8f)
+            if (hasSpeedChange) {
+                videoEffects.add(SpeedChangeEffect(clampedSpeed))
+            }
 
             if (includeTextOverlays && timeline.textClips.isNotEmpty()) {
                 val clipStartMs = timeline.mainClipStartMs(index)
@@ -83,26 +107,23 @@ object CompositionBuilder {
             }
 
             val audioProcessors = mutableListOf<AudioProcessor>()
-            if (!clip.isImage && !clip.isMuted && clip.speed != 1f) {
+            if (!clip.isImage && !clip.isMuted && hasSpeedChange) {
                 val sonic = SonicAudioProcessor().apply {
-                    setSpeed(clip.speed.coerceIn(0.1f, 10f))
+                    setSpeed(clampedSpeed)
                 }
                 audioProcessors.add(sonic)
             }
-            if (!clip.isImage && !clip.isMuted && clip.volume != 1f) {
-                val mixer = ChannelMixingAudioProcessor()
-                val v = clip.volume.coerceIn(0f, 2f)
-                mixer.putChannelMixingMatrix(ChannelMixingMatrix(2, 2, floatArrayOf(v, 0f, 0f, v)))
-                mixer.putChannelMixingMatrix(ChannelMixingMatrix(1, 2, floatArrayOf(v, v)))
-                audioProcessors.add(mixer)
+            if (!clip.isImage && !clip.isMuted && abs(clip.volume - 1f) > 0.01f) {
+                audioProcessors.add(GainAudioProcessor(clip.volume.coerceIn(0f, 2f)))
             }
 
             val itemBuilder = EditedMediaItem.Builder(mediaItemBuilder.build())
+                .setDurationUs(durationUs)
                 .setRemoveAudio(clip.isImage || clip.isMuted)
                 .setEffects(Effects(audioProcessors, videoEffects))
 
             if (clip.isImage) {
-                itemBuilder.setFrameRate(timeline.fps)
+                itemBuilder.setFrameRate(timeline.fps.coerceIn(24, 60))
             }
             itemBuilder.build()
         }
@@ -113,40 +134,47 @@ object CompositionBuilder {
         }
 
         // Additional Audio Tracks
-        val totalDurationUs = timeline.mainTrackDurationMs * 1000L
         timeline.audioClips.filter { !it.isMuted }.forEach { audioClip ->
+            val audioFile = File(audioClip.mediaPath)
+            if (!audioFile.exists()) return@forEach
+
+            val safeAudioSourceMs = audioClip.sourceDurationMs.coerceAtLeast(250L)
+            val safeAudioStartMs = audioClip.sourceStartMs.coerceIn(0L, safeAudioSourceMs - 100L)
+            val safeAudioEndMs = audioClip.sourceEndMs.coerceIn(safeAudioStartMs + 100L, safeAudioSourceMs)
+
             val mediaItem = MediaItem.Builder()
-                .setUri(Uri.fromFile(File(audioClip.mediaPath)))
+                .setUri(Uri.fromFile(audioFile))
                 .setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(audioClip.sourceStartMs)
-                        .setEndPositionMs(audioClip.sourceEndMs)
+                        .setStartPositionMs(safeAudioStartMs)
+                        .setEndPositionMs(safeAudioEndMs)
                         .build()
                 )
                 .build()
 
             val audioProcessors = mutableListOf<AudioProcessor>()
-            if (audioClip.volume != 1f) {
-                val mixer = ChannelMixingAudioProcessor()
-                val v = audioClip.volume.coerceIn(0f, 2f)
-                mixer.putChannelMixingMatrix(ChannelMixingMatrix(2, 2, floatArrayOf(v, 0f, 0f, v)))
-                mixer.putChannelMixingMatrix(ChannelMixingMatrix(1, 2, floatArrayOf(v, v)))
-                audioProcessors.add(mixer)
+            if (abs(audioClip.volume - 1f) > 0.01f) {
+                audioProcessors.add(GainAudioProcessor(audioClip.volume.coerceIn(0f, 2f)))
             }
 
             val editedAudio = EditedMediaItem.Builder(mediaItem)
+                .setDurationUs(safeAudioSourceMs * 1000L)
                 .setRemoveVideo(true)
                 .setEffects(Effects(audioProcessors, emptyList()))
                 .build()
 
-            val audioSeqBuilder = EditedMediaItemSequence.Builder(listOf(editedAudio))
-            if (audioClip.durationMs < timeline.mainTrackDurationMs && audioClip.timelineStartMs == 0L) {
-                // Keep exact duration without unwanted looping
+            val audioSeqBuilder = EditedMediaItemSequence.Builder()
+            // CompositionPlayer forbids gaps (!composition.hasGaps()), while Transformer supports them.
+            if (includeTextOverlays && audioClip.timelineStartMs > 0L) {
+                audioSeqBuilder.addGap(audioClip.timelineStartMs * 1000L)
             }
+            audioSeqBuilder.addItem(editedAudio)
             sequences.add(audioSeqBuilder.build())
         }
 
-        return Composition.Builder(sequences).build()
+        return Composition.Builder(sequences)
+            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
+            .build()
     }
 
     private fun createTextBitmapOverlay(
@@ -166,10 +194,16 @@ object CompositionBuilder {
                 }
                 val evaluated = KeyframeEvaluator.evaluateTextFrame(textClip, localMs)
                 return StaticOverlaySettings.Builder()
-                    .setAlphaScale(evaluated.transform.opacity)
-                    .setScale(evaluated.transform.scale, evaluated.transform.scale)
+                    .setAlphaScale(evaluated.transform.opacity.coerceIn(0f, 1f))
+                    .setScale(
+                        evaluated.transform.scale.coerceIn(0.1f, 5f),
+                        evaluated.transform.scale.coerceIn(0.1f, 5f)
+                    )
                     .setRotationDegrees(-evaluated.transform.rotationDeg)
-                    .setBackgroundFrameAnchor(evaluated.transform.posX, -evaluated.transform.posY)
+                    .setBackgroundFrameAnchor(
+                        evaluated.transform.posX.coerceIn(-2f, 2f),
+                        -evaluated.transform.posY.coerceIn(-2f, 2f)
+                    )
                     .setOverlayFrameAnchor(0f, 0f)
                     .build()
             }
@@ -190,11 +224,12 @@ object CompositionBuilder {
             this.typeface = typeface
         }
 
+        val safeText = textClip.text.ifBlank { " " }
         val maxWidth = 900
         val layout = StaticLayout.Builder.obtain(
-            textClip.text.ifBlank { " " },
+            safeText,
             0,
-            textClip.text.length.coerceAtLeast(1),
+            safeText.length,
             textPaint,
             maxWidth
         )
@@ -232,5 +267,53 @@ object CompositionBuilder {
         layout.draw(canvas)
         canvas.restore()
         return bitmap
+    }
+}
+
+/**
+ * Channel-count-agnostic PCM volume processor supporting 16-bit and 32-bit float audio
+ * across mono, stereo, and surround streams without failing on >2 channels.
+ */
+@OptIn(UnstableApi::class)
+private class GainAudioProcessor(private val gain: Float) : BaseAudioProcessor() {
+
+    override fun onConfigure(inputAudioFormat: AudioFormat): AudioFormat {
+        if (abs(gain - 1f) < 0.01f) {
+            return AudioFormat.NOT_SET
+        }
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
+            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
+            throw UnhandledAudioFormatException(inputAudioFormat)
+        }
+        return inputAudioFormat
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining == 0) return
+
+        val out = replaceOutputBuffer(remaining)
+        when (inputAudioFormat.encoding) {
+            C.ENCODING_PCM_16BIT -> {
+                while (inputBuffer.remaining() >= 2) {
+                    val sample = inputBuffer.getShort()
+                    val scaled = (sample * gain).roundToInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    out.putShort(scaled.toShort())
+                }
+            }
+            C.ENCODING_PCM_FLOAT -> {
+                while (inputBuffer.remaining() >= 4) {
+                    val sample = inputBuffer.getFloat()
+                    val scaled = (sample * gain).coerceIn(-1f, 1f)
+                    out.putFloat(scaled)
+                }
+            }
+        }
+        if (inputBuffer.hasRemaining()) {
+            out.put(inputBuffer)
+        }
+        out.flip()
     }
 }
