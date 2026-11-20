@@ -4,13 +4,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -388,6 +383,11 @@ fun EditorStudioScreen(
                             animationSpec = spring(stiffness = 420f),
                             label = "timeline_weight"
                         )
+                        val inspectorWeight by animateFloatAsState(
+                            targetValue = if (uiState.isInspectorExpanded) 0.37f else 0f,
+                            animationSpec = spring(stiffness = 420f),
+                            label = "inspector_weight"
+                        )
 
                         Column(modifier = Modifier.fillMaxSize()) {
                             ViewportCanvas(
@@ -440,13 +440,12 @@ fun EditorStudioScreen(
                                 modifier = Modifier.weight(timelineWeight)
                             )
 
-                            AnimatedVisibility(
-                                visible = uiState.isInspectorExpanded,
-                                enter = expandVertically(spring(stiffness = 420f)) + fadeIn(),
-                                exit = shrinkVertically(spring(stiffness = 420f)) + fadeOut(),
-                                modifier = Modifier.weight(if (uiState.isInspectorExpanded) 0.37f else 0.0001f)
-                            ) {
-                                Column(modifier = Modifier.fillMaxSize()) {
+                            if (inspectorWeight > 0.01f) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(inspectorWeight)
+                                        .fillMaxWidth()
+                                ) {
                                     HorizontalDivider(color = HairlineOutline, thickness = 1.dp)
                                     EditorToolInspectorPanel(
                                         uiState = uiState,
@@ -712,7 +711,8 @@ private fun EditorToolDock(
         LazyRow(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+                .testTag("editor_tool_dock"),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(EditorToolTab.entries) { tab ->

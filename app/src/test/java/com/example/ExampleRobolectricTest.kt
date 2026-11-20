@@ -2,6 +2,10 @@ package com.example
 
 import android.content.Context
 import androidx.annotation.OptIn
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.media3.common.util.UnstableApi
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -32,8 +36,12 @@ import com.example.engine.ExportConfig
 import com.example.engine.ExportQuality
 import com.example.engine.ExportResolution
 import com.example.engine.LiveClipRegistry
+import com.example.ui.screens.EditorStudioScreen
+import com.example.ui.screens.ProjectHubScreen
+import com.example.ui.theme.KinetikStudioTheme
 import com.example.ui.viewmodel.EditorToolTab
 import com.example.ui.viewmodel.EditorViewModel
+import com.example.ui.viewmodel.ProjectsUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
@@ -49,6 +57,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -59,6 +68,9 @@ import java.io.File
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class ExampleRobolectricTest {
+
+    @get:Rule
+    val composeRule = createComposeRule()
 
     private lateinit var context: Context
     private lateinit var db: KinetikDatabase
@@ -341,5 +353,137 @@ class ExampleRobolectricTest {
         assertEquals(ColorFilterPreset.TEAL_ORANGE, liveClip!!.colorGrade.preset)
         assertEquals(MaskType.CIRCLE, liveClip.mask.type)
         assertEquals(VisualEffectType.FILM_GRAIN, liveClip.visualEffect)
+    }
+
+    @Test
+    fun composeUi_projectHubRendersCreateSearchSortAndProjectCardActions() {
+        val videoFile = createTempMedia("hub_vid", ".mp4")
+        val seeded = runBlocking {
+            val clip = VideoClip(
+                id = "hub-clip-1",
+                displayName = "intro.mp4",
+                mediaPath = videoFile.absolutePath,
+                sourceDurationMs = 3500L
+            )
+            repository.saveTimeline(
+                projectId = "hub-proj-1",
+                title = "Reel Studio",
+                timeline = ProjectTimeline(mainClips = listOf(clip))
+            )
+            repository.getProject("hub-proj-1")!!
+        }
+
+        var openedId: String? = null
+        composeRule.setContent {
+            KinetikStudioTheme {
+                ProjectHubScreen(
+                    uiState = ProjectsUiState(projects = listOf(seeded)),
+                    onSearchChanged = {},
+                    onSortChanged = {},
+                    onCreateProject = { _, _ -> },
+                    onOpenProject = { openedId = it },
+                    onRenameProject = { _, _ -> },
+                    onDuplicateProject = {},
+                    onDeleteProject = {},
+                    onDismissError = {}
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("new_project_banner_button").assertExists()
+        composeRule.onNodeWithTag("new_project_fab").assertExists()
+        composeRule.onNodeWithTag("search_projects_input").assertExists()
+        composeRule.onNodeWithTag("project_card_${seeded.id}").performClick()
+        composeRule.waitForIdle()
+        assertEquals(seeded.id, openedId)
+    }
+
+    @Test
+    fun composeUi_editorStudioAllTabsActionsFullscreenAndExportWorkWithoutCrash() {
+        val videoFile = createTempMedia("ui_video", ".mp4")
+        val clip = VideoClip(
+            id = "ui-clip-1",
+            displayName = "clip.mp4",
+            mediaPath = videoFile.absolutePath,
+            sourceDurationMs = 4000L
+        )
+        val vm = createLoadedEditorViewModel(
+            projectId = "ui-proj-1",
+            timeline = ProjectTimeline(mainClips = listOf(clip))
+        )
+
+        composeRule.setContent {
+            KinetikStudioTheme {
+                EditorStudioScreen(
+                    viewModel = vm,
+                    onNavigateBack = {}
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("video_preview_viewport").assertExists()
+        composeRule.onNodeWithTag("multitrack_timeline").assertExists()
+
+        // Exercise every tool tab and primary action in real Compose layout
+        for (tab in EditorToolTab.entries) {
+            composeRule.onNodeWithTag("editor_tool_dock").performScrollToIndex(tab.ordinal)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("tool_tab_${tab.name}").performClick()
+            composeRule.waitForIdle()
+        }
+
+        // Split clip from EDIT tab
+        composeRule.onNodeWithTag("editor_tool_dock").performScrollToIndex(EditorToolTab.EDIT.ordinal)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("tool_tab_EDIT").performClick()
+        composeRule.waitForIdle()
+        vm.seekTo(1500L)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("split_clip_button").performClick()
+        composeRule.waitForIdle()
+        assertEquals(2, vm.uiState.value.timeline.mainClips.size)
+
+        // Add two keyframes and open Curve Editor sheet
+        composeRule.onNodeWithTag("editor_tool_dock").performScrollToIndex(EditorToolTab.KEYFRAME.ordinal)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("tool_tab_KEYFRAME").performClick()
+        composeRule.waitForIdle()
+        vm.seekTo(0L)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("toggle_keyframe_button").performClick()
+        composeRule.waitForIdle()
+        vm.seekTo(800L)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("toggle_keyframe_button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("open_curve_editor_button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("bezier_curve_canvas").assertExists()
+        vm.closeCurveEditor()
+        composeRule.waitForIdle()
+
+        // Add text overlay from TEXT tab
+        composeRule.onNodeWithTag("editor_tool_dock").performScrollToIndex(EditorToolTab.TEXT.ordinal)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("tool_tab_TEXT").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("add_text_button").performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, vm.uiState.value.timeline.textClips.size)
+
+        // Collapse & re-expand inspector
+        composeRule.onNodeWithTag("collapse_inspector_button").performClick()
+        composeRule.waitForIdle()
+        assertFalse(vm.uiState.value.isInspectorExpanded)
+        composeRule.onNodeWithTag("editor_tool_dock").performScrollToIndex(EditorToolTab.MASK.ordinal)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("tool_tab_MASK").performClick()
+        composeRule.waitForIdle()
+        assertTrue(vm.uiState.value.isInspectorExpanded)
+
+        // Open export sheet
+        composeRule.onNodeWithTag("open_export_button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("start_export_button").assertExists()
     }
 }

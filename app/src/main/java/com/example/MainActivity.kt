@@ -71,11 +71,15 @@ private fun KinetikApp() {
                 onSortChanged = vm::onSortOrderChanged,
                 onCreateProject = { title, uris ->
                     vm.createProject(title, uris) { createdId ->
-                        navController.navigate(EditorRoute(createdId))
+                        navController.navigate(EditorRoute(createdId)) {
+                            launchSingleTop = true
+                        }
                     }
                 },
                 onOpenProject = { id ->
-                    navController.navigate(EditorRoute(id))
+                    navController.navigate(EditorRoute(id)) {
+                        launchSingleTop = true
+                    }
                 },
                 onRenameProject = vm::renameProject,
                 onDuplicateProject = vm::duplicateProject,

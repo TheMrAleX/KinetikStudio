@@ -65,7 +65,16 @@ object CompositionBuilder {
             val durationUs: Long
             if (clip.isImage) {
                 val imgMs = clip.effectiveDurationMs.coerceAtLeast(100L)
-                mediaItemBuilder.setImageDurationMs(imgMs)
+                val imgMime = when (mediaFile.extension.lowercase()) {
+                    "png" -> androidx.media3.common.MimeTypes.IMAGE_PNG
+                    "webp" -> androidx.media3.common.MimeTypes.IMAGE_WEBP
+                    "bmp" -> androidx.media3.common.MimeTypes.IMAGE_BMP
+                    "heic", "heif" -> androidx.media3.common.MimeTypes.IMAGE_HEIF
+                    else -> androidx.media3.common.MimeTypes.IMAGE_JPEG
+                }
+                mediaItemBuilder
+                    .setMimeType(imgMime)
+                    .setImageDurationMs(imgMs)
                 durationUs = imgMs * 1000L
             } else {
                 val safeSourceMs = clip.sourceDurationMs.coerceAtLeast(250L)

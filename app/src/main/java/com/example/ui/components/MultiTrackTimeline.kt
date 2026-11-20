@@ -157,6 +157,7 @@ fun MultiTrackTimeline(
             .testTag("multitrack_timeline")
     ) {
         val halfViewportDp = maxWidth / 2
+        val viewportPx = with(density) { maxWidth.toPx() }
         val contentWidthDp = ((totalMs / 1000f) * pxPerSec).dp + 120.dp
 
         Column(
@@ -169,7 +170,9 @@ fun MultiTrackTimeline(
             TimeRulerRow(
                 totalDurationMs = totalMs,
                 pxPerSec = pxPerSec,
-                widthDp = contentWidthDp
+                widthDp = contentWidthDp,
+                scrollOffsetPx = scrollState.value.toFloat(),
+                viewportWidthPx = viewportPx
             )
 
             Spacer(Modifier.height(6.dp))
@@ -309,7 +312,9 @@ fun MultiTrackTimeline(
 private fun TimeRulerRow(
     totalDurationMs: Long,
     pxPerSec: Float,
-    widthDp: Dp
+    widthDp: Dp,
+    scrollOffsetPx: Float,
+    viewportWidthPx: Float
 ) {
     val stepSec = when {
         pxPerSec >= 180f -> 0.5f
@@ -318,7 +323,7 @@ private fun TimeRulerRow(
         else -> 5f
     }
     val stepMs = (stepSec * 1000f).toLong().coerceAtLeast(500L)
-    val textMeasurer = rememberTextMeasurer()
+    val textMeasurer = rememberTextMeasurer(cacheSize = 64)
     val labelStyle = remember { MonoTimecodeStyle.copy(fontSize = 10.sp, color = TextMuted) }
 
     Canvas(
@@ -326,8 +331,14 @@ private fun TimeRulerRow(
             .width(widthDp)
             .height(24.dp)
     ) {
-        var t = 0L
-        while (t <= totalDurationMs + stepMs) {
+        val pxPerMs = (pxPerSec * density / 1000f).coerceAtLeast(0.001f)
+        val marginPx = viewportWidthPx.coerceAtLeast(300f) * 0.6f
+        val minMs = (((scrollOffsetPx - marginPx) / pxPerMs).toLong().coerceAtLeast(0L) / stepMs) * stepMs
+        val maxMs = (((scrollOffsetPx + viewportWidthPx + marginPx) / pxPerMs).toLong())
+            .coerceAtMost(totalDurationMs + stepMs)
+
+        var t = minMs
+        while (t <= maxMs) {
             val x = (t / 1000f) * pxPerSec * density
             if (x <= size.width) {
                 drawLine(

@@ -107,7 +107,7 @@ fun ViewportCanvas(
     val currentIsPlaying by rememberUpdatedState(isPlaying)
     val latestTimeline by rememberUpdatedState(timeline)
 
-    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    val playerViewHolder = remember { arrayOfNulls<PlayerView>(1) }
     var activePlayer by remember { mutableStateOf<CompositionPlayer?>(null) }
     var playbackErrorMessage by remember { mutableStateOf<String?>(null) }
     var isGestureHudVisible by remember { mutableStateOf(false) }
@@ -119,7 +119,7 @@ fun ViewportCanvas(
     // Dispose and recreate the player cleanly on each compositionKey bump.
     DisposableEffect(context, compositionKey) {
         if (compositionKey < 0) {
-            playerViewRef?.player = null
+            runCatching { playerViewHolder[0]?.player = null }
             activePlayer = null
             playbackErrorMessage = null
             onDispose {}
@@ -154,13 +154,13 @@ fun ViewportCanvas(
                     val safeDuration = tl.totalDurationMs.coerceAtLeast(0L)
                     newPlayer.seekTo(currentPlayhead.coerceIn(0L, safeDuration))
                     newPlayer.playWhenReady = currentIsPlaying
-                    playerViewRef?.player = newPlayer
+                    runCatching { playerViewHolder[0]?.player = newPlayer }
                     activePlayer = newPlayer
                     createdPlayer = newPlayer
                     playerListener = listener
                     playbackErrorMessage = null
                 } else {
-                    playerViewRef?.player = null
+                    runCatching { playerViewHolder[0]?.player = null }
                     activePlayer = null
                 }
             }.onFailure { err ->
@@ -169,15 +169,15 @@ fun ViewportCanvas(
                     playerListener?.let { p.removeListener(it) }
                     runCatching { p.release() }
                 }
-                playerViewRef?.player = null
+                runCatching { playerViewHolder[0]?.player = null }
                 activePlayer = null
             }
 
             onDispose {
                 val p = createdPlayer
                 if (p != null) {
-                    if (playerViewRef?.player === p) {
-                        playerViewRef?.player = null
+                    if (playerViewHolder[0]?.player === p) {
+                        runCatching { playerViewHolder[0]?.player = null }
                     }
                     playerListener?.let { p.removeListener(it) }
                     runCatching { p.release() }
@@ -273,17 +273,26 @@ fun ViewportCanvas(
                             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             setKeepContentOnPlayerReset(true)
                             setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
-                            playerViewRef = this
-                            player = activePlayer
+                            playerViewHolder[0] = this
+                            runCatching { player = activePlayer }
                         }
                     },
                     update = { view ->
-                        if (playerViewRef !== view) {
-                            playerViewRef = view
+                        if (playerViewHolder[0] !== view) {
+                            playerViewHolder[0] = view
                         }
                         if (view.player !== activePlayer) {
-                            view.player = activePlayer
+                            runCatching { view.player = activePlayer }
+                                .onFailure { err ->
+                                    playbackErrorMessage = err.localizedMessage ?: "Error al vincular vista previa"
+                                }
                         }
+                    },
+                    onRelease = { view ->
+                        if (playerViewHolder[0] === view) {
+                            playerViewHolder[0] = null
+                        }
+                        runCatching { view.player = null }
                     },
                     modifier = Modifier.fillMaxSize()
                 )

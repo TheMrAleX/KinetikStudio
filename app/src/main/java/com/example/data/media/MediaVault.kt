@@ -47,27 +47,44 @@ class MediaVault(private val context: Context) {
 
     suspend fun importVisualMedia(projectId: String, uri: Uri): ImportedMediaResult =
         withContext(Dispatchers.IO) {
-            val mimeType = context.contentResolver.getType(uri) ?: ""
-            val isImage = mimeType.startsWith("image/")
-            val displayName = queryDisplayName(uri) ?: if (isImage) "Imagen.jpg" else "Clip.mp4"
-            val ext = resolveExtension(displayName, mimeType, if (isImage) "jpg" else "mp4")
+            val mimeType = runCatching { context.contentResolver.getType(uri) }.getOrNull().orEmpty()
+            val displayName = queryDisplayName(uri) ?: if (mimeType.startsWith("image/")) "Imagen.jpg" else "Clip.mp4"
+            val extLower = displayName.substringAfterLast('.', "").lowercase()
+            val uriExtLower = uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase().orEmpty()
+            val imageExts = setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "gif")
+            val preliminaryImage = mimeType.startsWith("image/") ||
+                extLower in imageExts ||
+                uriExtLower in imageExts
+            val fallbackExt = if (preliminaryImage) "jpg" else "mp4"
+            val ext = resolveExtension(displayName, mimeType, fallbackExt)
             val destFile = File(projectDir(projectId), "${UUID.randomUUID()}.$ext")
 
             copyUriToFile(uri, destFile)
 
+            // Verify image headers if MIME type was missing or generic (e.g., application/octet-stream)
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            val isImage = if (mimeType.startsWith("video/")) {
+                false
+            } else if (preliminaryImage) {
+                BitmapFactory.decodeFile(destFile.absolutePath, boundsOpts)
+                true
+            } else {
+                BitmapFactory.decodeFile(destFile.absolutePath, boundsOpts)
+                boundsOpts.outWidth > 0 && boundsOpts.outHeight > 0
+            }
+
             if (isImage) {
-                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(destFile.absolutePath, opts)
                 val thumbFile = File(thumbsDir(projectId), "${UUID.randomUUID()}_thumb.jpg")
-                createImageThumbnail(destFile, thumbFile)
+                createImageThumbnail(destFile, thumbFile, boundsOpts.outWidth, boundsOpts.outHeight)
+                val thumbList = if (thumbFile.exists()) listOf(thumbFile.absolutePath) else emptyList()
                 ImportedMediaResult(
                     displayName = displayName,
                     localPath = destFile.absolutePath,
                     isImage = true,
                     durationMs = 4000L,
-                    width = opts.outWidth.coerceAtLeast(1080),
-                    height = opts.outHeight.coerceAtLeast(1920),
-                    thumbnailPaths = listOf(thumbFile.absolutePath),
+                    width = boundsOpts.outWidth.coerceAtLeast(1080),
+                    height = boundsOpts.outHeight.coerceAtLeast(1920),
+                    thumbnailPaths = thumbList,
                     waveformPeaks = emptyList()
                 )
             } else {
@@ -83,10 +100,10 @@ class MediaVault(private val context: Context) {
                     )?.toLongOrNull()?.coerceAtLeast(500L) ?: 3000L
                     width = retriever.extractMetadata(
                         MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
-                    )?.toIntOrNull() ?: 1080
+                    )?.toIntOrNull()?.coerceAtLeast(1) ?: 1080
                     height = retriever.extractMetadata(
                         MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
-                    )?.toIntOrNull() ?: 1920
+                    )?.toIntOrNull()?.coerceAtLeast(1) ?: 1920
 
                     val thumbCount = (durationMs / 1500L).toInt().coerceIn(3, 10)
                     for (i in 0 until thumbCount) {
@@ -106,7 +123,7 @@ class MediaVault(private val context: Context) {
                             thumbs.add(thumbFile.absolutePath)
                         }
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     // Keep safe metadata defaults if device codec cannot decode frame thumbnail
                 } finally {
                     runCatching { retriever.release() }
@@ -128,7 +145,7 @@ class MediaVault(private val context: Context) {
 
     suspend fun importAudioMedia(projectId: String, uri: Uri): ImportedMediaResult =
         withContext(Dispatchers.IO) {
-            val mimeType = context.contentResolver.getType(uri) ?: "audio/mp4"
+            val mimeType = runCatching { context.contentResolver.getType(uri) }.getOrNull() ?: "audio/mp4"
             val displayName = queryDisplayName(uri) ?: "Audio.m4a"
             val ext = resolveExtension(displayName, mimeType, "m4a")
             val destFile = File(projectDir(projectId), "${UUID.randomUUID()}.$ext")
@@ -141,7 +158,7 @@ class MediaVault(private val context: Context) {
                 durationMs = retriever.extractMetadata(
                     MediaMetadataRetriever.METADATA_KEY_DURATION
                 )?.toLongOrNull()?.coerceAtLeast(500L) ?: 10_000L
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             } finally {
                 runCatching { retriever.release() }
             }
@@ -183,13 +200,24 @@ class MediaVault(private val context: Context) {
         } ?: throw IllegalStateException("No se pudo leer el archivo multimedia seleccionado")
     }
 
-    private fun createImageThumbnail(src: File, dst: File) {
-        val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-        val bmp = BitmapFactory.decodeFile(src.absolutePath, opts) ?: return
+    private fun createImageThumbnail(src: File, dst: File, srcW: Int, srcH: Int) {
+        var sampleSize = 1
+        val targetMax = 512
+        if (srcW > targetMax || srcH > targetMax) {
+            val halfW = srcW / 2
+            val halfH = srcH / 2
+            while ((halfW / sampleSize) >= targetMax && (halfH / sampleSize) >= targetMax) {
+                sampleSize *= 2
+            }
+        }
+        val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize.coerceAtLeast(1) }
+        val bmp = runCatching { BitmapFactory.decodeFile(src.absolutePath, opts) }.getOrNull() ?: return
         val scaled = scaleBitmapForStrip(bmp, 220)
         if (scaled !== bmp) bmp.recycle()
-        FileOutputStream(dst).use { out ->
-            scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        runCatching {
+            FileOutputStream(dst).use { out ->
+                scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            }
         }
         scaled.recycle()
     }
@@ -203,13 +231,15 @@ class MediaVault(private val context: Context) {
 
     private fun queryDisplayName(uri: Uri): String? {
         if (uri.scheme == "file") return uri.lastPathSegment
-        return context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (idx >= 0) cursor.getString(idx) else null
-                } else null
-            }
+        return runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) cursor.getString(idx) else null
+                    } else null
+                }
+        }.getOrNull()
     }
 
     private fun resolveExtension(name: String, mimeType: String, fallback: String): String {
